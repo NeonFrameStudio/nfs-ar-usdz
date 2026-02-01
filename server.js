@@ -17,17 +17,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Health ----------
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// ---------- Work dir ----------
 const WORK_DIR = "/tmp/ar";
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
+// Prefer Render's service URL as PUBLIC_BASE_URL in env, but fallback:
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
-// ---------- Runner ----------
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: "inherit" });
@@ -38,10 +34,12 @@ function run(cmd, args) {
   });
 }
 
-// ---------- Build USDZ ----------
+// Health
+app.get("/", (req, res) => res.status(200).send("ok"));
+
 app.post("/build-usdz", async (req, res) => {
   try {
-    const { imageUrl, widthCm, heightCm } = req.body || {};
+    const { imageUrl, widthCm, heightCm } = req.body;
     if (!imageUrl || !widthCm || !heightCm) {
       return res.status(400).json({ ok: false, reason: "missing_params" });
     }
@@ -49,14 +47,13 @@ app.post("/build-usdz", async (req, res) => {
     const id = crypto.randomUUID();
     const imgPath = path.join(WORK_DIR, `${id}.png`);
     const glbPath = path.join(WORK_DIR, `${id}.glb`);
-    const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
 
-    // 1) Download image
+    // Download image
     const r = await fetch(imageUrl);
-    if (!r.ok) throw new Error(`image_download_failed_${r.status}`);
+    if (!r.ok) throw new Error("image_download_failed");
     fs.writeFileSync(imgPath, Buffer.from(await r.arrayBuffer()));
 
-    // 2) Blender -> GLB
+    // 1) Blender -> GLB
     await run("blender", [
       "-b",
       "-P",
@@ -68,8 +65,14 @@ app.post("/build-usdz", async (req, res) => {
       String(heightCm),
     ]);
 
-    // 3) GLB -> USDZ (must exist in container as /usr/local/bin/usdzconvert)
-    await run("usdzconvert", [glbPath, usdzPath]);
+    // 2) GLB -> USDZ (python usdzconvert)
+    // This tool outputs a .usdz next to the input file by default.
+    await run("python3", ["/home/usdzconvert/usdzconvert", glbPath]);
+
+    const usdzPath = glbPath.replace(/\.glb$/i, ".usdz");
+    if (!fs.existsSync(usdzPath)) {
+      throw new Error("usdz_not_created");
+    }
 
     return res.json({
       ok: true,
@@ -85,23 +88,17 @@ app.post("/build-usdz", async (req, res) => {
   }
 });
 
-// ---------- Static serve ----------
+// Serve USDZ
 app.use(
   "/usdz",
   express.static(WORK_DIR, {
     setHeaders(res, p) {
       if (p.toLowerCase().endsWith(".usdz")) {
         res.setHeader("Content-Type", "model/vnd.usdz+zip");
-        res.setHeader("Content-Disposition", "inline");
-        res.setHeader("Cache-Control", "no-store");
       }
     },
   })
 );
 
-// ✅ IMPORTANT: Render port binding (NO HARDCODE)
-const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("USDZ server running on port", PORT);
-  console.log("PUBLIC_BASE_URL:", PUBLIC_BASE_URL);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("USDZ server running on port", PORT));
