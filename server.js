@@ -7,6 +7,20 @@ import crypto from "crypto";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+// ---- CORS (required for Shopify storefront -> Render) ----
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
+
 /* --------------------------------------------------
    CONFIG
 -------------------------------------------------- */
