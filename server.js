@@ -3,77 +3,85 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import { spawn } from "child_process";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ---- CORS (required for Shopify storefront -> Render) ----
+// -------------------- CORS --------------------
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-
+  res.set(CORS_HEADERS);
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-
-/* --------------------------------------------------
-   CONFIG
--------------------------------------------------- */
-
+// -------------------- CONFIG --------------------
 const WORK_DIR = "/tmp/ar";
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
-// Render public URL (fallback safe)
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
-/* --------------------------------------------------
-   BUILD USDZ (PHASE 1 – STUBBED, AR WORKS)
--------------------------------------------------- */
+// -------------------- UTILS --------------------
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: "inherit" });
+    p.on("error", reject);
+    p.on("close", (code) =>
+      code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))
+    );
+  });
+}
+
+// -------------------- ROUTES --------------------
+app.options("/build-usdz", (req, res) => {
+  res.set(CORS_HEADERS);
+  return res.sendStatus(204);
+});
 
 app.post("/build-usdz", async (req, res) => {
+  res.set(CORS_HEADERS);
+
   try {
     const { imageUrl, widthCm, heightCm } = req.body;
 
     if (!imageUrl || !widthCm || !heightCm) {
-      return res.status(400).json({
-        ok: false,
-        reason: "missing_params"
-      });
+      return res.status(400).json({ ok: false, reason: "missing_params" });
     }
 
-    // --------------------------------------------------
-    // STEP 1: Download image (prove pipeline works)
-    // --------------------------------------------------
     const id = crypto.randomUUID();
-    const imgPath = path.join(WORK_DIR, `${id}.png`);
+    const imgPath  = path.join(WORK_DIR, `${id}.png`);
+    const usdPath  = path.join(WORK_DIR, `${id}.usd`);
+    const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
 
+    // download image
     const r = await fetch(imageUrl);
     if (!r.ok) throw new Error("image_download_failed");
+    fs.writeFileSync(imgPath, Buffer.from(await r.arrayBuffer()));
 
-    const buf = Buffer.from(await r.arrayBuffer());
-    fs.writeFileSync(imgPath, buf);
+    // build USD via Blender
+    await run("blender", [
+      "-b",
+      "-P", "/app/make_usd.py",
+      "--",
+      imgPath,
+      usdPath,
+      String(widthCm),
+      String(heightCm),
+    ]);
 
-    // --------------------------------------------------
-    // STEP 2: TEMP USDZ (Apple demo model)
-    // --------------------------------------------------
-    // This proves:
-    // - Button works
-    // - iOS AR Quick Look opens
-    // - Safari does NOT auto-close
-    //
-    // We will replace this with real Blender output later.
-    // --------------------------------------------------
+    // package USDZ
+    await run("usdzip", [usdzPath, usdPath]);
 
     return res.json({
       ok: true,
-      usdzUrl:
-        "https://developer.apple.com/augmented-reality/quick-look/models/retrotv/retrotv.usdz"
+      usdzUrl: `${PUBLIC_BASE_URL}/usdz/${id}.usdz`,
     });
 
   } catch (e) {
@@ -81,21 +89,24 @@ app.post("/build-usdz", async (req, res) => {
     return res.status(500).json({
       ok: false,
       reason: "server_error",
-      message: String(e?.message || e)
+      message: String(e?.message || e),
     });
   }
 });
 
-/* --------------------------------------------------
-   STATIC (reserved for Phase 2)
--------------------------------------------------- */
+// -------------------- STATIC USDZ --------------------
+app.use(
+  "/usdz",
+  express.static(WORK_DIR, {
+    setHeaders(res, p) {
+      if (p.endsWith(".usdz")) {
+        res.setHeader("Content-Type", "model/vnd.usdz+zip");
+      }
+    },
+  })
+);
 
-app.use("/usdz", express.static(WORK_DIR));
-
-/* --------------------------------------------------
-   START SERVER
--------------------------------------------------- */
-
+// -------------------- START --------------------
 app.listen(3000, () => {
   console.log("USDZ server running on port 3000");
 });
