@@ -3,45 +3,85 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { execSync } from "child_process";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+/* --------------------------------------------------
+   CONFIG
+-------------------------------------------------- */
+
 const WORK_DIR = "/tmp/ar";
 fs.mkdirSync(WORK_DIR, { recursive: true });
+
+// Render public URL (fallback safe)
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
+
+/* --------------------------------------------------
+   BUILD USDZ (PHASE 1 – STUBBED, AR WORKS)
+-------------------------------------------------- */
 
 app.post("/build-usdz", async (req, res) => {
   try {
     const { imageUrl, widthCm, heightCm } = req.body;
 
     if (!imageUrl || !widthCm || !heightCm) {
-      return res.status(400).json({ ok: false, reason: "missing_params" });
+      return res.status(400).json({
+        ok: false,
+        reason: "missing_params"
+      });
     }
 
+    // --------------------------------------------------
+    // STEP 1: Download image (prove pipeline works)
+    // --------------------------------------------------
     const id = crypto.randomUUID();
     const imgPath = path.join(WORK_DIR, `${id}.png`);
-    const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
 
     const r = await fetch(imageUrl);
     if (!r.ok) throw new Error("image_download_failed");
+
     const buf = Buffer.from(await r.arrayBuffer());
     fs.writeFileSync(imgPath, buf);
 
-    execSync(
-      `blender -b -P generate-usdz.py -- "${imgPath}" "${usdzPath}" ${widthCm} ${heightCm}`,
-      { stdio: "inherit" }
-    );
+    // --------------------------------------------------
+    // STEP 2: TEMP USDZ (Apple demo model)
+    // --------------------------------------------------
+    // This proves:
+    // - Button works
+    // - iOS AR Quick Look opens
+    // - Safari does NOT auto-close
+    //
+    // We will replace this with real Blender output later.
+    // --------------------------------------------------
 
-    res.json({
+    return res.json({
       ok: true,
-      usdzUrl: `${process.env.PUBLIC_BASE_URL}/usdz/${id}.usdz`
+      usdzUrl:
+        "https://developer.apple.com/augmented-reality/quick-look/models/retrotv/retrotv.usdz"
     });
+
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, reason: "server_error" });
+    console.error("BUILD_USDZ_ERROR:", e);
+    return res.status(500).json({
+      ok: false,
+      reason: "server_error",
+      message: String(e?.message || e)
+    });
   }
 });
 
+/* --------------------------------------------------
+   STATIC (reserved for Phase 2)
+-------------------------------------------------- */
+
 app.use("/usdz", express.static(WORK_DIR));
-app.listen(3000, () => console.log("USDZ server running"));
+
+/* --------------------------------------------------
+   START SERVER
+-------------------------------------------------- */
+
+app.listen(3000, () => {
+  console.log("USDZ server running on port 3000");
+});
