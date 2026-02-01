@@ -1,12 +1,11 @@
 FROM node:22-bookworm
 
+# ---------------- Linux deps ----------------
 RUN apt-get update && apt-get install -y \
   wget \
-  tar \
-  xz-utils \
+  unzip \
   python3 \
   ca-certificates \
-  unzip \
   libxxf86vm1 \
   libx11-6 \
   libxext6 \
@@ -25,7 +24,7 @@ RUN apt-get update && apt-get install -y \
   libdbus-1-3 \
   && rm -rf /var/lib/apt/lists/*
 
-# Blender 3.6 LTS
+# ---------------- Blender 3.6 ----------------
 WORKDIR /opt
 RUN wget https://download.blender.org/release/Blender3.6/blender-3.6.5-linux-x64.tar.xz \
   && tar -xf blender-3.6.5-linux-x64.tar.xz \
@@ -33,15 +32,15 @@ RUN wget https://download.blender.org/release/Blender3.6/blender-3.6.5-linux-x64
 
 ENV PATH="/opt/blender-3.6.5-linux-x64:${PATH}"
 
-# Apple usdzconvert (Reality Converter tools)
-# NOTE: This is a Linux-friendly build from Apple's USD tools bundle.
-# We fetch a known working usdzconvert binary package.
-RUN wget -O usdztools.zip https://github.com/google/usd_from_gltf/releases/download/v0.2/usd_from_gltf_linux.zip \
-  && unzip usdztools.zip -d /opt/usdztools \
-  && rm usdztools.zip
+# ---------------- USDZ converter ----------------
+WORKDIR /opt
+RUN wget https://github.com/google/usd_from_gltf/releases/download/v0.2/usd_from_gltf_linux.zip \
+  && unzip usd_from_gltf_linux.zip \
+  && chmod +x usdzconvert \
+  && mv usdzconvert /usr/local/bin/usdzconvert \
+  && rm usd_from_gltf_linux.zip
 
-ENV PATH="/opt/usdztools:${PATH}"
-
+# ---------------- App ----------------
 WORKDIR /app
 COPY package.json ./
 RUN npm install
