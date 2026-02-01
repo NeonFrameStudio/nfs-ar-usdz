@@ -8,7 +8,7 @@ import { spawn } from "child_process";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ---- CORS ----
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -17,65 +17,77 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- CONFIG ----
 const WORK_DIR = "/tmp/ar";
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
-// ---- RUN CMD ----
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: "inherit" });
-    p.on("close", c => (c === 0 ? resolve() : reject(new Error(cmd + " failed"))));
+    p.on("error", reject);
+    p.on("close", (code) =>
+      code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))
+    );
   });
 }
 
-// ---- ROUTE ----
 app.post("/build-usdz", async (req, res) => {
   try {
     const { imageUrl, widthCm, heightCm } = req.body;
-    if (!imageUrl || !widthCm || !heightCm)
-      return res.status(400).json({ ok: false });
+    if (!imageUrl || !widthCm || !heightCm) {
+      return res.status(400).json({ ok: false, reason: "missing_params" });
+    }
 
     const id = crypto.randomUUID();
-    const imgPath  = path.join(WORK_DIR, `${id}.png`);
+    const imgPath = path.join(WORK_DIR, `${id}.png`);
+    const glbPath = path.join(WORK_DIR, `${id}.glb`);
     const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
 
     // download image
     const r = await fetch(imageUrl);
+    if (!r.ok) throw new Error("image_download_failed");
     fs.writeFileSync(imgPath, Buffer.from(await r.arrayBuffer()));
 
-    // Blender exports USDZ directly
+    // 1) Blender -> GLB (reliable)
     await run("blender", [
       "-b",
-      "-P", "/app/make_usdz.py",
+      "-P",
+      "/app/make_glb.py",
       "--",
       imgPath,
-      usdzPath,
+      glbPath,
       String(widthCm),
-      String(heightCm)
+      String(heightCm),
     ]);
+
+    // 2) GLB -> USDZ (reliable)
+    await run("usdzconvert", [glbPath, usdzPath]);
 
     return res.json({
       ok: true,
-      usdzUrl: `${PUBLIC_BASE_URL}/usdz/${id}.usdz`
+      usdzUrl: `${PUBLIC_BASE_URL}/usdz/${id}.usdz`,
     });
-
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false });
+    console.error("BUILD_USDZ_ERROR:", e);
+    return res.status(500).json({
+      ok: false,
+      reason: "server_error",
+      message: String(e?.message || e),
+    });
   }
 });
 
-// ---- STATIC ----
-app.use("/usdz", express.static(WORK_DIR, {
-  setHeaders(res, p) {
-    if (p.endsWith(".usdz")) {
-      res.setHeader("Content-Type", "model/vnd.usdz+zip");
-    }
-  }
-}));
+app.use(
+  "/usdz",
+  express.static(WORK_DIR, {
+    setHeaders(res, p) {
+      if (p.endsWith(".usdz")) {
+        res.setHeader("Content-Type", "model/vnd.usdz+zip");
+      }
+    },
+  })
+);
 
-app.listen(3000, () => console.log("USDZ server running"));
+app.listen(3000, () => console.log("USDZ server running on port 3000"));
