@@ -3,8 +3,8 @@ import bpy, sys
 argv = sys.argv[sys.argv.index("--")+1:]
 IMG, GLB, W, H = argv
 
-W = float(W)/100
-H = float(H)/100
+W = float(W) / 100.0
+H = float(H) / 100.0
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
@@ -24,14 +24,17 @@ tex.image = bpy.data.images.load(IMG)
 em = nodes.new("ShaderNodeEmission")
 out = nodes.new("ShaderNodeOutputMaterial")
 
-links.new(tex.outputs[0], em.inputs[0])
-links.new(em.outputs[0], out.inputs[0])
+# Use named sockets (stable)
+links.new(tex.outputs["Color"], em.inputs["Color"])
+links.new(em.outputs["Emission"], out.inputs["Surface"])
 
 p.data.materials.append(mat)
 
+# Export GLB with embedded textures
 bpy.ops.export_scene.gltf(
   filepath=GLB,
-  export_format='GLB',
+  export_format="GLB",
   export_yup=True,
-  export_apply=True
+  export_apply=True,
+  export_images="EMBEDDED"
 )
