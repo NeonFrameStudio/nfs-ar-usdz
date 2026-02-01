@@ -30,5 +30,7 @@ p.data.materials.append(mat)
 bpy.ops.wm.usd_export(
   filepath=USDZ,
   export_textures=True,
-  export_materials=True
+  export_materials=True,
+  export_usdz=True
 )
+
