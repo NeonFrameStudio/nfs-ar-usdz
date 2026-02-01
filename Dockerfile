@@ -1,18 +1,33 @@
 FROM node:22-bookworm
 
-# Install Blender
-RUN apt-get update && apt-get install -y blender && rm -rf /var/lib/apt/lists/*
+# -----------------------------
+# Install system deps
+# -----------------------------
+RUN apt-get update && apt-get install -y \
+  blender \
+  usd-utils \
+  python3 \
+  && rm -rf /var/lib/apt/lists/*
 
+# -----------------------------
 # App directory
+# -----------------------------
 WORKDIR /app
 
-# Copy files
+# -----------------------------
+# Install node deps
+# -----------------------------
 COPY package.json ./
 RUN npm install
 
+# -----------------------------
+# Copy app
+# -----------------------------
 COPY . .
 
-# Render uses PORT env var
+# -----------------------------
+# Render config
+# -----------------------------
 ENV PORT=3000
 EXPOSE 3000
 
