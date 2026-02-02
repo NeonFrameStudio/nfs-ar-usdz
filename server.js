@@ -24,9 +24,9 @@ fs.mkdirSync(WORK_DIR, { recursive: true });
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
-function run(cmd, args) {
+function run(cmd, args, cwd = undefined) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: "inherit" });
+    const p = spawn(cmd, args, { stdio: "inherit", cwd });
     p.on("error", reject);
     p.on("close", (code) =>
       code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))
@@ -34,29 +34,20 @@ function run(cmd, args) {
   });
 }
 
-// -----------------------------
-// Helpers
-// -----------------------------
-
 function parseDataUrl(dataUrl) {
-  // data:image/png;base64,XXXX
   const m = String(dataUrl || "").match(/^data:([^;]+);base64,(.+)$/i);
   if (!m) return null;
   return { mime: m[1], b64: m[2] };
 }
 
 async function bufferToNormalizedPng(buf, outPngPath) {
-  if (!buf || buf.length < 200) {
-    throw new Error(`image_too_small:${buf ? buf.length : 0}`);
-  }
+  if (!buf || buf.length < 200) throw new Error(`image_too_small:${buf ? buf.length : 0}`);
 
-  // If it’s HTML, it’s not an image (blocked/expired/redirect page)
   const head = buf.slice(0, 200).toString("utf8").toLowerCase();
   if (head.includes("<html") || head.includes("<!doctype html")) {
     throw new Error(`image_is_html_not_image`);
   }
 
-  // Convert ANYTHING to a guaranteed valid PNG
   const png = await sharp(buf, { failOnError: true })
     .png({ compressionLevel: 9 })
     .toBuffer();
@@ -93,13 +84,9 @@ async function dataUrlAndNormalizeToPng(imageDataUrl, outPngPath) {
   return { source: "dataUrl", mime: parsed.mime, ...info };
 }
 
-// -----------------------------
-// Route
-// -----------------------------
 app.post("/build-usdz", async (req, res) => {
   try {
     const { imageUrl, imageDataUrl, widthCm, heightCm } = req.body;
-
     if ((!imageUrl && !imageDataUrl) || !widthCm || !heightCm) {
       return res.status(400).json({
         ok: false,
@@ -109,14 +96,20 @@ app.post("/build-usdz", async (req, res) => {
     }
 
     const id = crypto.randomUUID();
-    const pngPath = path.join(WORK_DIR, `${id}.png`);
-    const usdPath = path.join(WORK_DIR, `${id}.usd`);
+
+    // ✅ Use a per-job folder so Blender outputs + textures stay together
+    const jobDir = path.join(WORK_DIR, id);
+    fs.mkdirSync(jobDir, { recursive: true });
+
+    // Always write texture as a fixed name INSIDE jobDir
+    const texturePath = path.join(jobDir, "texture.png");
+    const usdPath = path.join(jobDir, "model.usd");
     const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
 
-    // 0) get PNG
+    // 0) Get normalized PNG -> jobDir/texture.png
     const info = imageDataUrl
-      ? await dataUrlAndNormalizeToPng(imageDataUrl, pngPath)
-      : await downloadAndNormalizeToPng(imageUrl, pngPath);
+      ? await dataUrlAndNormalizeToPng(imageDataUrl, texturePath)
+      : await downloadAndNormalizeToPng(imageUrl, texturePath);
 
     // 1) Blender -> USD (flat plane w/ texture)
     await run("blender", [
@@ -124,7 +117,7 @@ app.post("/build-usdz", async (req, res) => {
       "-P",
       "/app/make_usd.py",
       "--",
-      pngPath,
+      texturePath,
       usdPath,
       String(widthCm),
       String(heightCm),
@@ -132,10 +125,12 @@ app.post("/build-usdz", async (req, res) => {
 
     if (!fs.existsSync(usdPath)) throw new Error("usd_missing");
 
-    // 2) Package USD + PNG into USDZ
+    // 2) Package EVERYTHING in jobDir into USDZ (textures folder, etc.)
+    // Apple expects STORE/no compression: zip -0
+    // We zip the CONTENTS of jobDir so paths inside USDZ are correct.
     await run("bash", [
       "-lc",
-      `cd ${WORK_DIR} && rm -f ${id}.usdz && zip -0 ${id}.usdz ${id}.usd ${id}.png`,
+      `cd ${jobDir} && rm -f "${usdzPath}" && zip -0 -r "${usdzPath}" .`,
     ]);
 
     if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
@@ -155,7 +150,7 @@ app.post("/build-usdz", async (req, res) => {
   }
 });
 
-// Serve files
+// Serve USDZ files
 app.use(
   "/usdz",
   express.static(WORK_DIR, {
@@ -164,8 +159,6 @@ app.use(
         res.setHeader("Content-Type", "model/vnd.usdz+zip");
         res.setHeader("Content-Disposition", 'inline; filename="model.usdz"');
       }
-      if (p.endsWith(".usd")) res.setHeader("Content-Type", "application/octet-stream");
-      if (p.endsWith(".png")) res.setHeader("Content-Type", "image/png");
     },
   })
 );
