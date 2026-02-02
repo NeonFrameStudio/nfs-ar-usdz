@@ -1,20 +1,24 @@
 import bpy, sys, os
 
 argv = sys.argv[sys.argv.index("--")+1:]
-IMG, USD_OUT, W_CM, H_CM = argv
+IMG, USD_OUT, WCM, HCM = argv
 
-W = float(W_CM) / 100.0
-H = float(H_CM) / 100.0
+W = float(WCM) / 100.0
+H = float(HCM) / 100.0
 
-# clean scene
+out_dir = os.path.dirname(USD_OUT)
+tex_name = "texture.png"
+tex_path = os.path.join(out_dir, tex_name)
+
+# Fresh scene
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
-# plane
+# Create plane
 bpy.ops.mesh.primitive_plane_add(size=1)
 p = bpy.context.active_object
 p.scale = (W/2.0, H/2.0, 1)
 
-# material with image texture
+# Material (emission so it's bright in AR)
 mat = bpy.data.materials.new("Mat")
 mat.use_nodes = True
 nodes = mat.node_tree.nodes
@@ -24,21 +28,21 @@ nodes.clear()
 tex = nodes.new("ShaderNodeTexImage")
 tex.image = bpy.data.images.load(IMG)
 
-# Principled so USD exporter behaves
-bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+# Save a local copy of the texture to the same folder as the USD
+# so we can package it into the .usdz
+tex.image.filepath_raw = tex_path
+tex.image.save()
+
+em = nodes.new("ShaderNodeEmission")
 out = nodes.new("ShaderNodeOutputMaterial")
 
-links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+links.new(tex.outputs[0], em.inputs[0])
+links.new(em.outputs[0], out.inputs[0])
 
 p.data.materials.append(mat)
 
-# Ensure texture file is treated as an asset path
-# (USD exporter picks it up as an external file)
-tex.image.filepath = IMG
-
-# Export to USD (usdc)
-# NOTE: Blender’s args differ across versions; these are safe.
+# Export USD (NOT "export_usdz" — that flag is what broke you)
+# We export a .usd and texture alongside it.
 bpy.ops.wm.usd_export(
     filepath=USD_OUT,
     export_textures=True,
