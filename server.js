@@ -6,7 +6,6 @@ import crypto from "crypto";
 import { spawn } from "child_process";
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
 
 /* --------------------------------------------------
    CONFIG
@@ -20,28 +19,33 @@ const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
 /* --------------------------------------------------
-   CORS (FIX)
+   CORS (FINAL FIX)
 -------------------------------------------------- */
 
 /**
- * Why this is required:
- * Your Shopify site (https://www.neonframestudio.com) calls this API cross-origin.
- * Browsers do a CORS preflight (OPTIONS) for JSON POST requests.
- * Without Access-Control-Allow-Origin on the OPTIONS + POST response, the browser blocks it.
+ * Shopify storefront calls this API cross-origin.
+ * JSON POST triggers a CORS preflight (OPTIONS).
+ *
+ * The OPTIONS response MUST include:
+ * - Access-Control-Allow-Origin
+ * - Access-Control-Allow-Methods
+ * - Access-Control-Allow-Headers (must include requested headers)
+ *
+ * Otherwise the browser blocks the POST before it even reaches your code.
  */
 
-// Comma-separated list of exact origins you want to allow.
-// Example value:
-// https://www.neonframestudio.com,https://neonframestudio.com,https://admin.shopify.com
+// Comma-separated list of exact origins you also want to allow via env.
+// Example:
+// CORS_ALLOW_ORIGINS=https://admin.shopify.com,https://your-preview-domain.com
 const EXTRA_ALLOWED_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // non-browser clients / Quick Look / curl
+  if (!origin) return true; // Non-browser clients (curl, server-to-server, etc.)
 
-  // Always allow your main storefronts
+  // Exact allowlist
   const hardAllow = new Set([
     "https://www.neonframestudio.com",
     "https://neonframestudio.com",
@@ -50,12 +54,16 @@ function isAllowedOrigin(origin) {
 
   if (hardAllow.has(origin)) return true;
 
-  // Allow Shopify preview domains (theme preview / checkout surfaces often come from these)
-  // Examples:
-  // https://xxxx.myshopify.com
-  // https://xxxx.shopify.com (rare, but keep flexible)
+  // Allow any secure subdomain of neonframestudio.com
+  // e.g. https://staging.neonframestudio.com
+  if (/^https:\/\/([a-z0-9-]+\.)*neonframestudio\.com$/i.test(origin)) return true;
+
+  // Shopify preview / theme editor surfaces
+  // e.g. https://xxxx.myshopify.com
   if (/^https:\/\/[a-z0-9-]+\.myshopify\.com$/i.test(origin)) return true;
-  if (/^https:\/\/[a-z0-9-]+\.shopify\.com$/i.test(origin)) return true;
+
+  // Sometimes Shopify tooling uses these
+  if (/^https:\/\/admin\.shopify\.com$/i.test(origin)) return true;
 
   // Local dev
   if (/^http:\/\/localhost(:\d+)?$/i.test(origin)) return true;
@@ -67,29 +75,48 @@ function isAllowedOrigin(origin) {
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
+  // Always vary on origin for caches/proxies
+  res.setHeader("Vary", "Origin");
+
+  // Only set CORS headers for allowed origins
   if (isAllowedOrigin(origin)) {
-    // Echo the requesting origin (safer than "*")
     if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
 
+    // Methods your API supports
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With"
-    );
 
-    // If you ever use cookies/credentials, you MUST set this and cannot use "*"
+    // IMPORTANT: Echo requested headers to avoid mismatch
+    // Browser sends: Access-Control-Request-Headers: content-type
+    const reqHeaders = req.headers["access-control-request-headers"];
+    if (reqHeaders) {
+      res.setHeader("Access-Control-Allow-Headers", String(reqHeaders));
+    } else {
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, X-Requested-With"
+      );
+    }
+
+    // Optional: cache preflight for 1 day
+    res.setHeader("Access-Control-Max-Age", "86400");
+
+    // If you ever use cookies/credentials, uncomment this AND do not use "*"
     // res.setHeader("Access-Control-Allow-Credentials", "true");
   }
 
-  // Handle preflight immediately
+  // Preflight must return immediately
   if (req.method === "OPTIONS") {
-    // Some browsers want a 204, some accept 200—204 is standard.
     return res.status(204).end();
   }
 
   next();
 });
+
+/* --------------------------------------------------
+   BODY PARSER
+-------------------------------------------------- */
+
+app.use(express.json({ limit: "10mb" }));
 
 /* --------------------------------------------------
    UTILS
@@ -178,7 +205,9 @@ async function ensureUsdc(usdPath) {
   const outPath = usdPath.replace(/\.usd$/i, ".usdc.usd");
 
   // Detect usdcat existence
-  const which = await runCmd("sh", ["-lc", "command -v usdcat"], { timeoutMs: 8000 });
+  const which = await runCmd("sh", ["-lc", "command -v usdcat"], {
+    timeoutMs: 8000,
+  });
   if (!which.ok || !which.out.trim()) {
     result.converter = "usdcat_missing";
     return result;
@@ -195,7 +224,6 @@ async function ensureUsdc(usdPath) {
   result.converterLogs = { out: conv.out, err: conv.err };
 
   if (conv.ok && fs.existsSync(outPath) && fileSize(outPath) > 16) {
-    // Swap in converted file
     fs.copyFileSync(outPath, usdPath);
     result.converted = true;
     result.header = readUsdHeader8(usdPath);
@@ -208,10 +236,9 @@ async function ensureUsdc(usdPath) {
  * Fix common USD metadata that Quick Look / ARKit often expects.
  * - Ensure upAxis is Y
  * - Ensure metersPerUnit exists
- * - Ensure defaultPrim is set (Quick Look can fail without it)
+ * - Ensure defaultPrim is set
  */
 async function fixUsdForQuickLook(usdPath) {
-  // If pxr bindings aren't available, we just skip (and rely on conversion + usdzip).
   const py = `
 from pxr import Usd, UsdGeom
 import sys
@@ -222,16 +249,13 @@ if not stage:
   print("ERR: cannot open", path)
   sys.exit(2)
 
-# Y-up for ARKit
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
 
-# Reasonable default
 try:
   stage.SetMetersPerUnit(1.0)
 except Exception:
   pass
 
-# Ensure a defaultPrim exists
 default = stage.GetDefaultPrim()
 if not default:
   kids = stage.GetPseudoRoot().GetChildren()
@@ -242,7 +266,6 @@ stage.Save()
 print("OK")
 `;
   const r = await runCmd("python3", ["-c", py, usdPath], { timeoutMs: 20000 });
-  // If python/pxr isn't installed, don't hard-fail — just record and continue.
   if (!r.ok) {
     return { ok: false, note: "pxr_python_missing_or_failed", ...r };
   }
@@ -255,13 +278,11 @@ async function hasUsdzip() {
 }
 
 async function buildUsdzWithUsdzip(outUsdzPath, usdPath, assetPaths) {
-  // usdzip usage is typically: usdzip output.usdz input.usd [assets...]
   const args = [outUsdzPath, usdPath, ...(assetPaths || [])];
   return await runCmd("usdzip", args, { timeoutMs: 60000 });
 }
 
 async function buildUsdzWithZip(outUsdzPath, jobDir, files) {
-  // Fallback: zip -0 (STORE). NOTE: may still fail Quick Look due to alignment requirements.
   const cmd = `cd "${jobDir}" && zip -0 -q "${outUsdzPath}" ${files
     .map((f) => `"${f}"`)
     .join(" ")}`;
@@ -303,7 +324,7 @@ app.post("/build-usdz", async (req, res) => {
     const imgBuf = Buffer.from(await imgResp.arrayBuffer());
     fs.writeFileSync(texPath, imgBuf);
 
-    // 2) Run Blender (make_usd.py) to generate model.usd referencing texture.png
+    // 2) Run Blender (make_usd.py)
     const blender = await runCmd(
       "sh",
       [
@@ -315,12 +336,8 @@ app.post("/build-usdz", async (req, res) => {
       { timeoutMs: 120000 }
     );
 
-    if (!blender.ok) {
-      throw new Error("blender_failed");
-    }
-    if (!fs.existsSync(usdPath)) {
-      throw new Error("usd_missing");
-    }
+    if (!blender.ok) throw new Error("blender_failed");
+    if (!fs.existsSync(usdPath)) throw new Error("usd_missing");
 
     // Ensure USDC if possible
     const usdcCheck = await ensureUsdc(usdPath);
@@ -331,7 +348,6 @@ app.post("/build-usdz", async (req, res) => {
     // Build USDZ (prefer usdzip; fallback zip)
     let usdzBuild = { ok: false, method: null, out: "", err: "" };
 
-    // Always remove any previous file
     try {
       fs.unlinkSync(usdzPath);
     } catch {}
@@ -352,10 +368,7 @@ app.post("/build-usdz", async (req, res) => {
 
     if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
 
-    // Public URL
     const publicUsdzUrl = `${PUBLIC_BASE_URL}/usdz/${jobId}/${jobId}.usdz`;
-
-    // Helpful listing for debugging
     const jobDirListing = fs.readdirSync(jobDir);
     const usdzListing = `Archive: ${usdzPath}`;
 
@@ -397,12 +410,10 @@ app.post("/build-usdz", async (req, res) => {
    SERVE USDZ FILES
 -------------------------------------------------- */
 
-// Serve /usdz/<jobId>/<jobId>.usdz
 app.get("/usdz/:jobId/:file", (req, res) => {
   try {
     const { jobId, file } = req.params;
 
-    // Safety: only allow exact expected filename
     if (file !== `${jobId}.usdz`) {
       return res.status(404).send("not_found");
     }
