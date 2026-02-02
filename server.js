@@ -24,7 +24,7 @@ fs.mkdirSync(WORK_DIR, { recursive: true });
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
-// ✅ PATCH: capture stdout/stderr so you can SEE why Blender failed
+// capture stdout/stderr
 function run(cmd, args, cwd = undefined) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { cwd });
@@ -58,7 +58,7 @@ async function bufferToNormalizedPng(buf, outPngPath) {
     throw new Error("image_is_html_not_image");
   }
 
-  // Normalize to PNG (removes weird encodings + guarantees alpha handling)
+  // Normalize to PNG (strips weird profiles/encodings)
   const png = await sharp(buf, { failOnError: true })
     .png({ compressionLevel: 9 })
     .toBuffer();
@@ -95,9 +95,73 @@ async function dataUrlAndNormalizeToPng(imageDataUrl, outPngPath) {
   return { source: "dataUrl", mime: parsed.mime, ...info };
 }
 
+function readUsdHeader8(usdPath) {
+  const h = fs.readFileSync(usdPath).subarray(0, 8);
+  return {
+    ascii: h.toString("ascii"),
+    hex: Buffer.from(h).toString("hex"),
+  };
+}
+
+// If USD is not USDC, attempt to convert using usdcat (from your stage1 tools)
+async function ensureUsdc(jobDir, usdPath) {
+  const header = readUsdHeader8(usdPath);
+
+  // USDC typically starts with "PXR-USDC" (or similar); USDA is readable text "#usda"
+  const looksUsdc = header.ascii.includes("PXR-USD") && !header.ascii.includes("#usda");
+  const isUsda = header.ascii.includes("#usda") || header.ascii.toLowerCase().includes("usda");
+
+  const result = {
+    header,
+    converted: false,
+    converter: null,
+    converterLogs: null,
+  };
+
+  if (looksUsdc && !isUsda) return result;
+
+  // Try usdcat -> write back into model.usd as USDC
+  // (Keep .usd extension but binary content)
+  const tmpOut = path.join(jobDir, "model_usdc.usd");
+  try {
+    const logs = await run(
+      "bash",
+      ["-lc", `cd "${jobDir}" && usdcat "${usdPath}" -o "${tmpOut}"`],
+      jobDir
+    );
+
+    if (fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 100) {
+      fs.copyFileSync(tmpOut, usdPath);
+      fs.unlinkSync(tmpOut);
+
+      result.converted = true;
+      result.converter = "usdcat";
+      result.converterLogs = {
+        out: (logs.out || "").slice(0, 4000),
+        err: (logs.err || "").slice(0, 4000),
+      };
+
+      // Update header after conversion
+      result.headerAfter = readUsdHeader8(usdPath);
+    }
+
+    return result;
+  } catch (e) {
+    // Don’t hard-fail here; return debug so we can see if usdcat exists
+    result.converter = "usdcat_failed";
+    result.converterLogs = {
+      out: (e?.out || "").slice(0, 4000),
+      err: (e?.err || "").slice(0, 4000),
+      spawnError: e?.e ? String(e.e?.message || e.e) : null,
+      kind: e?.kind,
+      code: e?.code,
+    };
+    return result;
+  }
+}
+
 app.post("/build-usdz", async (req, res) => {
   let jobDir = null;
-  let blenderLogs = null;
 
   try {
     const { imageUrl, imageDataUrl, widthCm, heightCm } = req.body;
@@ -114,7 +178,6 @@ app.post("/build-usdz", async (req, res) => {
     jobDir = path.join(WORK_DIR, id);
     fs.mkdirSync(jobDir, { recursive: true });
 
-    // Keep ALL assets in jobDir so USD references can be relative
     const texturePath = path.join(jobDir, "texture.png");
     const usdPath = path.join(jobDir, "model.usd");
     const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
@@ -124,9 +187,8 @@ app.post("/build-usdz", async (req, res) => {
       ? await dataUrlAndNormalizeToPng(imageDataUrl, texturePath)
       : await downloadAndNormalizeToPng(imageUrl, texturePath);
 
-    // 1) Blender -> USD
-    // ✅ Run Blender with cwd = jobDir to keep relative-path behavior consistent
-    blenderLogs = await run(
+    // 1) Blender -> USD (cwd = jobDir)
+    const blenderLogs = await run(
       "blender",
       [
         "-b",
@@ -146,8 +208,10 @@ app.post("/build-usdz", async (req, res) => {
       throw new Error(`usd_missing (jobDir contents: ${JSON.stringify(listing)})`);
     }
 
+    // 1.5) Verify/Convert to USDC if needed
+    const usdcCheck = await ensureUsdc(jobDir, usdPath);
+
     // 2) Zip jobDir CONTENTS as USDZ (STORE only)
-    // Important: cd into jobDir so paths inside usdz are relative.
     const zipLogs = await run(
       "bash",
       ["-lc", `cd "${jobDir}" && rm -f "${usdzPath}" && zip -0 -r "${usdzPath}" .`],
@@ -156,9 +220,22 @@ app.post("/build-usdz", async (req, res) => {
 
     if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
 
+    // Extra: list contents of the usdz
+    let usdzListing = null;
+    try {
+      const l = await run("bash", ["-lc", `unzip -l "${usdzPath}" | sed -n '1,200p'`], jobDir);
+      usdzListing = (l.out || "").slice(0, 4000);
+    } catch {
+      usdzListing = null;
+    }
+
+    const listing = fs.existsSync(jobDir) ? fs.readdirSync(jobDir) : null;
+
     return res.json({
       ok: true,
       debug: info,
+      jobDirListing: listing,
+      usd: usdcCheck,
       blender: {
         out: (blenderLogs?.out || "").slice(0, 8000),
         err: (blenderLogs?.err || "").slice(0, 8000),
@@ -167,12 +244,12 @@ app.post("/build-usdz", async (req, res) => {
         out: (zipLogs?.out || "").slice(0, 4000),
         err: (zipLogs?.err || "").slice(0, 4000),
       },
+      usdzListing,
       usdzUrl: `${PUBLIC_BASE_URL}/usdz/${id}.usdz`,
     });
   } catch (e) {
     console.error("BUILD_USDZ_ERROR:", e);
 
-    // if run() rejected, it will include logs
     const logs =
       e && (e.out || e.err || e.e)
         ? {
@@ -184,7 +261,6 @@ app.post("/build-usdz", async (req, res) => {
           }
         : null;
 
-    // also include jobDir listing if we have it (super useful)
     const listing =
       jobDir && fs.existsSync(jobDir) ? fs.readdirSync(jobDir) : null;
 
@@ -206,7 +282,6 @@ app.use(
       if (p.endsWith(".usdz")) {
         res.setHeader("Content-Type", "model/vnd.usdz+zip");
         res.setHeader("Content-Disposition", 'inline; filename="model.usdz"');
-        // helpful for Safari/QuickLook
         res.setHeader("Cache-Control", "no-store");
       }
     },
