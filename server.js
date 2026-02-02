@@ -3,7 +3,7 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 import sharp from "sharp";
 
 const app = express();
@@ -108,8 +108,11 @@ async function ensureUsdc(jobDir, usdPath) {
   const header = readUsdHeader8(usdPath);
 
   // USDC typically starts with "PXR-USDC" (or similar); USDA is readable text "#usda"
-  const looksUsdc = header.ascii.includes("PXR-USD") && !header.ascii.includes("#usda");
-  const isUsda = header.ascii.includes("#usda") || header.ascii.toLowerCase().includes("usda");
+  const looksUsdc =
+    header.ascii.includes("PXR-USD") && !header.ascii.includes("#usda");
+  const isUsda =
+    header.ascii.includes("#usda") ||
+    header.ascii.toLowerCase().includes("usda");
 
   const result = {
     header,
@@ -160,6 +163,38 @@ async function ensureUsdc(jobDir, usdPath) {
   }
 }
 
+// 🔥 NEW: Extract embedded texture/path strings from the USD (this is what Quick Look AR really cares about)
+function extractUsdStringHits(usdPath) {
+  let hits = [];
+  try {
+    if (fs.existsSync(usdPath)) {
+      const out = execSync(`strings "${usdPath}"`, {
+        stdio: ["ignore", "pipe", "pipe"],
+      }).toString("utf-8");
+
+      hits = out
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((l) => {
+          const s = l.toLowerCase();
+          return (
+            s.includes(".png") ||
+            s.includes(".jpg") ||
+            s.includes(".jpeg") ||
+            s.includes("/tmp") ||
+            s.includes("texture") ||
+            s.includes("textures/")
+          );
+        })
+        .slice(0, 80);
+    }
+  } catch (e) {
+    hits = [`strings_failed: ${e?.message || String(e)}`];
+  }
+  return hits;
+}
+
 app.post("/build-usdz", async (req, res) => {
   let jobDir = null;
 
@@ -205,11 +240,16 @@ app.post("/build-usdz", async (req, res) => {
 
     if (!fs.existsSync(usdPath)) {
       const listing = fs.existsSync(jobDir) ? fs.readdirSync(jobDir) : [];
-      throw new Error(`usd_missing (jobDir contents: ${JSON.stringify(listing)})`);
+      throw new Error(
+        `usd_missing (jobDir contents: ${JSON.stringify(listing)})`
+      );
     }
 
     // 1.5) Verify/Convert to USDC if needed
     const usdcCheck = await ensureUsdc(jobDir, usdPath);
+
+    // 🔥 1.6) Extract “what’s actually inside the USD” (paths/textures)
+    const usdStringHits = extractUsdStringHits(usdPath);
 
     // 2) Zip jobDir CONTENTS as USDZ (STORE only)
     const zipLogs = await run(
@@ -223,7 +263,11 @@ app.post("/build-usdz", async (req, res) => {
     // Extra: list contents of the usdz
     let usdzListing = null;
     try {
-      const l = await run("bash", ["-lc", `unzip -l "${usdzPath}" | sed -n '1,200p'`], jobDir);
+      const l = await run(
+        "bash",
+        ["-lc", `unzip -l "${usdzPath}" | sed -n '1,200p'`],
+        jobDir
+      );
       usdzListing = (l.out || "").slice(0, 4000);
     } catch {
       usdzListing = null;
@@ -236,6 +280,7 @@ app.post("/build-usdz", async (req, res) => {
       debug: info,
       jobDirListing: listing,
       usd: usdcCheck,
+      usdStringHits, // 🔥 THIS is the “truth output” for AR failures
       blender: {
         out: (blenderLogs?.out || "").slice(0, 8000),
         err: (blenderLogs?.err || "").slice(0, 8000),
