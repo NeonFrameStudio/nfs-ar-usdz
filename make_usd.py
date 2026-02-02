@@ -15,7 +15,7 @@ def enable_usd_addon():
     candidates = ["io_scene_usd", "usd", "io_usd"]
     for mod in candidates:
         try:
-            state = addon_utils.check(mod)  # (enabled, loaded) style
+            state = addon_utils.check(mod)
             if state[0] is not None:
                 bpy.ops.preferences.addon_enable(module=mod)
                 return mod
@@ -29,30 +29,35 @@ enabled = enable_usd_addon()
 bpy.ops.mesh.primitive_plane_add(size=1)
 p = bpy.context.active_object
 p.scale = (W / 2.0, H / 2.0, 1.0)
-
-# Ensure it’s named predictably
 p.name = "NFS_Plane"
 
-# ---------- Material (Principled, AR-friendly) ----------
+# ---------- Material (AR-friendly) ----------
 mat = bpy.data.materials.new("NFS_Mat")
 mat.use_nodes = True
 nodes = mat.node_tree.nodes
 links = mat.node_tree.links
 
-# Clear default nodes
 for n in list(nodes):
     nodes.remove(n)
 
 tex = nodes.new("ShaderNodeTexImage")
 tex.location = (-400, 0)
 
-# Load the PNG you wrote (jobDir/texture.png)
+# Load the PNG you already created: jobDir/texture.png
 img = bpy.data.images.load(IMG)
+
+# ✅ CRITICAL:
+# Force the image path to be just "texture.png" (relative),
+# so the USD references it correctly INSIDE the USDZ.
+base_name = os.path.basename(IMG)
+img.filepath = base_name
+img.filepath_raw = base_name
+
 tex.image = img
 
-# Force sRGB for standard images
+# Prefer sRGB
 try:
-    tex.image.colorspace_settings.name = "sRGB"
+    img.colorspace_settings.name = "sRGB"
 except Exception:
     pass
 
@@ -62,30 +67,27 @@ bsdf.location = (-100, 0)
 out = nodes.new("ShaderNodeOutputMaterial")
 out.location = (200, 0)
 
-# Base color
 links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
 
-# Slight emission so it pops in AR (optional but nice)
+# Small emission so it pops
 if "Emission" in bsdf.inputs:
     links.new(tex.outputs["Color"], bsdf.inputs["Emission"])
 if "Emission Strength" in bsdf.inputs:
     bsdf.inputs["Emission Strength"].default_value = 0.8
 
-# Reduce roughness a bit (looks better)
 if "Roughness" in bsdf.inputs:
     bsdf.inputs["Roughness"].default_value = 0.35
 
 links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
-# Assign material to plane
 p.data.materials.clear()
 p.data.materials.append(mat)
 
-# ---------- USD Export ----------
+# ---------- Export USD ----------
 if not hasattr(bpy.ops.wm, "usd_export"):
     raise RuntimeError(f"bpy.ops.wm.usd_export not found. USD addon enabled: {enabled}")
 
-# Introspect operator properties so we only pass supported args
+# Only pass args supported by this Blender build
 props = set()
 try:
     props = set(bpy.ops.wm.usd_export.get_rna_type().properties.keys())
@@ -95,23 +97,24 @@ except Exception:
 kwargs = {
     "filepath": USD,
     "export_materials": True,
-    "export_textures": True,
 }
 
-# CRITICAL: make paths inside USD relative so USDZ can resolve textures
+# ✅ IMPORTANT:
+# Do NOT export textures; we already have texture.png and we forced the USD to point to it.
+if "export_textures" in props:
+    kwargs["export_textures"] = False
+
+# ✅ Relative paths so it references "texture.png"
 if "relative_paths" in props:
     kwargs["relative_paths"] = True
 
-# Helpful: keep texture files near the USD if Blender supports it
-# (different Blender builds name this differently)
-for key in ["texture_dir", "export_texture_dir", "textures_dir"]:
-    if key in props:
-        kwargs[key] = "."  # write texture outputs into the same folder as the USD
-        break
+# Prefer ASCII (easier/safer)
+if "export_format" in props:
+    # Blender often expects: 'USD', 'USDA', 'USDC' depending on build
+    # We'll try the common "USDA" first, fallback if it errors.
+    try:
+        kwargs["export_format"] = "USDA"
+    except Exception:
+        pass
 
-# Some builds offer "overwrite_textures"
-if "overwrite_textures" in props:
-    kwargs["overwrite_textures"] = True
-
-# Export
 bpy.ops.wm.usd_export(**kwargs)
