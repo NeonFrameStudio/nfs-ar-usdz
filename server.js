@@ -8,6 +8,11 @@ import { spawn } from "child_process";
 const app = express();
 
 /* --------------------------------------------------
+   VERSION STAMP (so you can confirm correct deploy)
+-------------------------------------------------- */
+const SERVER_VERSION = "server.js vCORS-2026-02-03";
+
+/* --------------------------------------------------
    CONFIG
 -------------------------------------------------- */
 
@@ -19,50 +24,48 @@ const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
 /* --------------------------------------------------
-   CORS (FINAL FIX)
+   CORS (ACTUAL FIX — matches your screenshot issue)
 -------------------------------------------------- */
 
 /**
- * Shopify storefront calls this API cross-origin.
- * JSON POST triggers a CORS preflight (OPTIONS).
+ * Your browser is doing:
+ * 1) OPTIONS /build-usdz (preflight)
+ * 2) POST /build-usdz (real request)
  *
- * The OPTIONS response MUST include:
- * - Access-Control-Allow-Origin
- * - Access-Control-Allow-Methods
- * - Access-Control-Allow-Headers (must include requested headers)
+ * Your screenshot shows:
+ * OPTIONS 204 but ACAO/ACAH are null => browser blocks POST.
  *
- * Otherwise the browser blocks the POST before it even reaches your code.
+ * Fix:
+ * - Always return ACAO + ACAH + ACAM on OPTIONS when origin is allowed
+ * - Keep CORS headers on error responses too
  */
 
-// Comma-separated list of exact origins you also want to allow via env.
-// Example:
-// CORS_ALLOW_ORIGINS=https://admin.shopify.com,https://your-preview-domain.com
+// Extra allowlist via env (comma separated)
 const EXTRA_ALLOWED_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Hard allow (exact)
+const HARD_ALLOW = new Set([
+  "https://www.neonframestudio.com",
+  "https://neonframestudio.com",
+  ...EXTRA_ALLOWED_ORIGINS,
+]);
+
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // Non-browser clients (curl, server-to-server, etc.)
+  // Allow server-to-server / curl (no Origin header)
+  if (!origin) return true;
 
-  // Exact allowlist
-  const hardAllow = new Set([
-    "https://www.neonframestudio.com",
-    "https://neonframestudio.com",
-    ...EXTRA_ALLOWED_ORIGINS,
-  ]);
-
-  if (hardAllow.has(origin)) return true;
+  if (HARD_ALLOW.has(origin)) return true;
 
   // Allow any secure subdomain of neonframestudio.com
-  // e.g. https://staging.neonframestudio.com
   if (/^https:\/\/([a-z0-9-]+\.)*neonframestudio\.com$/i.test(origin)) return true;
 
-  // Shopify preview / theme editor surfaces
-  // e.g. https://xxxx.myshopify.com
+  // Shopify shop domain
   if (/^https:\/\/[a-z0-9-]+\.myshopify\.com$/i.test(origin)) return true;
 
-  // Sometimes Shopify tooling uses these
+  // Shopify admin surfaces (sometimes)
   if (/^https:\/\/admin\.shopify\.com$/i.test(origin)) return true;
 
   // Local dev
@@ -72,21 +75,20 @@ function isAllowedOrigin(origin) {
   return false;
 }
 
-app.use((req, res, next) => {
+function applyCors(req, res) {
   const origin = req.headers.origin;
 
-  // Always vary on origin for caches/proxies
+  // always vary for caches/proxies
   res.setHeader("Vary", "Origin");
 
-  // Only set CORS headers for allowed origins
+  // If allowed, reflect origin (DON’T use "*")
   if (isAllowedOrigin(origin)) {
     if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
 
-    // Methods your API supports
+    // Methods supported
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
 
-    // IMPORTANT: Echo requested headers to avoid mismatch
-    // Browser sends: Access-Control-Request-Headers: content-type
+    // Echo requested headers if present (critical for preflight)
     const reqHeaders = req.headers["access-control-request-headers"];
     if (reqHeaders) {
       res.setHeader("Access-Control-Allow-Headers", String(reqHeaders));
@@ -97,19 +99,34 @@ app.use((req, res, next) => {
       );
     }
 
-    // Optional: cache preflight for 1 day
+    // Cache preflight for 1 day
     res.setHeader("Access-Control-Max-Age", "86400");
 
-    // If you ever use cookies/credentials, uncomment this AND do not use "*"
+    // If you ever move to cookies/sessions, you can enable this
     // res.setHeader("Access-Control-Allow-Credentials", "true");
   }
+}
 
-  // Preflight must return immediately
+// Global CORS middleware (runs BEFORE body parsing)
+app.use((req, res, next) => {
+  try {
+    applyCors(req, res);
+  } catch {}
+
+  // Preflight must return immediately (WITH headers already set above)
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
 
   next();
+});
+
+// Extra explicit OPTIONS handler (belt + braces)
+app.options("/build-usdz", (req, res) => {
+  try {
+    applyCors(req, res);
+  } catch {}
+  return res.status(204).end();
 });
 
 /* --------------------------------------------------
@@ -183,7 +200,7 @@ async function runCmd(cmd, args, { cwd, timeoutMs } = {}) {
 }
 
 /**
- * If the USD coming out of Blender is USDA (ASCII), Quick Look is much happier with USDC (binary).
+ * If the USD coming out of Blender is USDA (ASCII), Quick Look is often happier with USDC (binary).
  * This tries to convert using usdcat if present.
  */
 async function ensureUsdc(usdPath) {
@@ -201,7 +218,6 @@ async function ensureUsdc(usdPath) {
   // Already USDC?
   if (result.header.ascii === "PXR-USDC") return result;
 
-  // If USDA or something else, try convert to USDC using usdcat
   const outPath = usdPath.replace(/\.usd$/i, ".usdc.usd");
 
   // Detect usdcat existence
@@ -377,6 +393,7 @@ app.post("/build-usdz", async (req, res) => {
       requestId,
       usdzUrl: publicUsdzUrl,
       debug: {
+        serverVersion: SERVER_VERSION,
         source: "url",
         imageUrl,
         bytesIn: imgBuf.length,
@@ -398,10 +415,12 @@ app.post("/build-usdz", async (req, res) => {
       jobDirListing,
     });
   } catch (err) {
+    // IMPORTANT: CORS headers should still be present (global middleware already ran)
     return res.status(500).json({
       ok: false,
       requestId,
       reason: err?.message || String(err),
+      debug: { serverVersion: SERVER_VERSION },
     });
   }
 });
@@ -437,7 +456,38 @@ app.get("/usdz/:jobId/:file", (req, res) => {
    HEALTH
 -------------------------------------------------- */
 
-app.get("/", (req, res) => res.send("OK"));
+app.get("/", (req, res) => {
+  return res.json({
+    ok: true,
+    serverVersion: SERVER_VERSION,
+  });
+});
+
+/* --------------------------------------------------
+   ERROR HANDLER (keeps CORS on unexpected failures)
+-------------------------------------------------- */
+
+app.use((err, req, res, next) => {
+  try {
+    applyCors(req, res);
+  } catch {}
+
+  console.error("Unhandled error:", err);
+  if (res.headersSent) return next(err);
+
+  return res.status(500).json({
+    ok: false,
+    reason: "server_error",
+    serverVersion: SERVER_VERSION,
+  });
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("UnhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UncaughtException:", err);
+});
 
 /* --------------------------------------------------
    START
@@ -445,5 +495,5 @@ app.get("/", (req, res) => res.send("OK"));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`USDZ server running on port ${PORT}`);
+  console.log(`USDZ server running on port ${PORT} (${SERVER_VERSION})`);
 });
