@@ -1,5 +1,8 @@
-import bpy, sys
+import bpy, sys, os
 import addon_utils
+
+def log(*a):
+    print("[make_usd]", *a)
 
 argv = sys.argv[sys.argv.index("--") + 1:]
 IMG, USD, W, H = argv
@@ -8,50 +11,51 @@ IMG, USD, W, H = argv
 W = float(W) / 100.0
 H = float(H) / 100.0
 
-# physical thickness (meters)
-DEPTH = 0.015  # 1.5cm
+log("IMG:", IMG)
+log("USD:", USD)
+log("W,H(m):", W, H)
 
-# ---------- Reset scene ----------
+# Reset
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
-# ---------- Enable USD exporter ----------
+# Enable USD addon if present
 def enable_usd_addon():
     for mod in ("io_scene_usd", "usd", "io_usd"):
         try:
             state = addon_utils.check(mod)
             if state[0] is not None:
                 bpy.ops.preferences.addon_enable(module=mod)
+                log("Enabled addon:", mod)
                 return mod
-        except Exception:
-            pass
+        except Exception as e:
+            log("Addon check error:", mod, e)
+    log("No USD addon explicitly enabled (may be built-in).")
     return None
 
 enable_usd_addon()
 
-# ---------- Create thin box ----------
-bpy.ops.mesh.primitive_cube_add(size=1)
-obj = bpy.context.active_object
-obj.name = "NFS_Frame"
+# Create plane
+bpy.ops.mesh.primitive_plane_add(size=1)
+p = bpy.context.active_object
+p.name = "NFS_Plane"
+p.scale = (W / 2.0, H / 2.0, 1.0)
 
-# scale to real size (Blender cube is 2 units across if you scale directly;
-# using /2 makes final dimensions match W/H/DEPTH)
-obj.scale = (W / 2.0, H / 2.0, DEPTH / 2.0)
-
-# ---------- Create material (front only) ----------
-mat = bpy.data.materials.new("NFS_Mat_Front")
+# Material
+mat = bpy.data.materials.new("NFS_Mat")
 mat.use_nodes = True
 nodes = mat.node_tree.nodes
 links = mat.node_tree.links
 nodes.clear()
 
 tex = nodes.new("ShaderNodeTexImage")
+tex.location = (-500, 0)
 
-# Load the PNG that your server already normalized into jobDir/texture.png
 img = bpy.data.images.load(IMG)
 
-# 🔥 CRITICAL: force the USD to reference EXACTLY "texture.png" inside the USDZ root
+# CRITICAL: force the image path referenced INSIDE the USD to be exactly "texture.png"
 img.filepath = "texture.png"
 img.filepath_raw = "texture.png"
+
 try:
     img.colorspace_settings.name = "sRGB"
 except Exception:
@@ -60,78 +64,63 @@ except Exception:
 tex.image = img
 
 bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-out = nodes.new("ShaderNodeOutputMaterial")
+bsdf.location = (-150, 0)
 
-links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-
-# a little emission helps in AR lighting
+# Make it pop in AR
 if "Emission" in bsdf.inputs:
     links.new(tex.outputs["Color"], bsdf.inputs["Emission"])
 if "Emission Strength" in bsdf.inputs:
-    bsdf.inputs["Emission Strength"].default_value = 0.8
-
+    bsdf.inputs["Emission Strength"].default_value = 1.0
 if "Roughness" in bsdf.inputs:
     bsdf.inputs["Roughness"].default_value = 0.35
 
+links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+
+out = nodes.new("ShaderNodeOutputMaterial")
+out.location = (250, 0)
+
 links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
-# ---------- Assign material ONLY to the front face ----------
-# We’ll create 2 materials:
-#  - slot 0: dark neutral for sides/back
-#  - slot 1: textured front
-side_mat = bpy.data.materials.new("NFS_Mat_Sides")
-side_mat.use_nodes = True
-s_nodes = side_mat.node_tree.nodes
-s_links = side_mat.node_tree.links
-# keep default Principled; just set dark-ish base
+p.data.materials.clear()
+p.data.materials.append(mat)
+
+# Export USD
+if not hasattr(bpy.ops.wm, "usd_export"):
+    raise RuntimeError("bpy.ops.wm.usd_export not available in this Blender build")
+
+# Only pass supported args
+props = set()
 try:
-    s_bsdf = s_nodes.get("Principled BSDF")
-    if s_bsdf and "Base Color" in s_bsdf.inputs:
-        s_bsdf.inputs["Base Color"].default_value = (0.05, 0.05, 0.06, 1.0)
-    if s_bsdf and "Roughness" in s_bsdf.inputs:
-        s_bsdf.inputs["Roughness"].default_value = 0.6
+    props = set(bpy.ops.wm.usd_export.get_rna_type().properties.keys())
 except Exception:
     pass
 
-obj.data.materials.clear()
-obj.data.materials.append(side_mat)  # slot 0
-obj.data.materials.append(mat)       # slot 1
+kwargs = {
+    "filepath": USD,
+    "export_materials": True,
+}
 
-# Put cube in edit mode and set material index by face normal:
-# front face in Blender is usually +Y for the default cube.
-bpy.context.view_layer.objects.active = obj
-bpy.ops.object.mode_set(mode="EDIT")
-bpy.ops.mesh.select_all(action="DESELECT")
-bpy.ops.object.mode_set(mode="OBJECT")
+# We already package texture.png ourselves
+if "export_textures" in props:
+    kwargs["export_textures"] = False
 
-import math
+# Ensure relative texture reference is kept
+if "relative_paths" in props:
+    kwargs["relative_paths"] = True
 
-# pick the face with the largest +Y normal as "front"
-best_i = None
-best_dot = -999.0
-for i, poly in enumerate(obj.data.polygons):
-    n = poly.normal
-    dot = n.y  # +Y
-    if dot > best_dot:
-        best_dot = dot
-        best_i = i
+# FORCE BINARY (this is the big Quick Look reliability win)
+if "export_format" in props:
+    kwargs["export_format"] = "USDC"
 
-# assign: everything -> sides (0), front -> textured (1)
-for poly in obj.data.polygons:
-    poly.material_index = 0
-if best_i is not None:
-    obj.data.polygons[best_i].material_index = 1
+log("usd_export kwargs:", kwargs)
 
-bpy.ops.object.mode_set(mode="OBJECT")
+bpy.ops.wm.usd_export(**kwargs)
 
-# ---------- Export USD (BINARY USDC REQUIRED FOR iOS AR) ----------
-if not hasattr(bpy.ops.wm, "usd_export"):
-    raise RuntimeError("USD exporter not available")
+# Validate output
+if not os.path.exists(USD):
+    # print folder listing to debug
+    base = os.path.dirname(USD)
+    log("USD NOT CREATED. Dir listing:", base, os.listdir(base) if os.path.isdir(base) else "missing dir")
+    raise RuntimeError("usd_not_created")
 
-bpy.ops.wm.usd_export(
-    filepath=USD,
-    export_materials=True,
-    export_textures=False,   # texture.png already exists in jobDir
-    relative_paths=True,
-    export_format="USDC"     # 🔥 REQUIRED FOR QUICK LOOK AR
-)
+log("USD created OK:", USD, "bytes:", os.path.getsize(USD))
