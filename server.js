@@ -41,7 +41,9 @@ function parseDataUrl(dataUrl) {
 }
 
 async function bufferToNormalizedPng(buf, outPngPath) {
-  if (!buf || buf.length < 200) throw new Error(`image_too_small:${buf ? buf.length : 0}`);
+  if (!buf || buf.length < 200) {
+    throw new Error(`image_too_small:${buf ? buf.length : 0}`);
+  }
 
   const head = buf.slice(0, 200).toString("utf8").toLowerCase();
   if (head.includes("<html") || head.includes("<!doctype html")) {
@@ -101,12 +103,12 @@ app.post("/build-usdz", async (req, res) => {
     const jobDir = path.join(WORK_DIR, id);
     fs.mkdirSync(jobDir, { recursive: true });
 
-    // Always write texture as a fixed name INSIDE jobDir
-    const texturePath = path.join(jobDir, "texture.png");
-    const usdPath = path.join(jobDir, "model.usd");
+    // ✅ Deterministic names (Quick Look + packaging stability)
+    const texturePath = path.join(jobDir, `${id}.png`);
+    const usdPath = path.join(jobDir, `${id}.usd`);
     const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
 
-    // 0) Get normalized PNG -> jobDir/texture.png
+    // 0) Get normalized PNG -> jobDir/<id>.png
     const info = imageDataUrl
       ? await dataUrlAndNormalizeToPng(imageDataUrl, texturePath)
       : await downloadAndNormalizeToPng(imageUrl, texturePath);
@@ -125,12 +127,27 @@ app.post("/build-usdz", async (req, res) => {
 
     if (!fs.existsSync(usdPath)) throw new Error("usd_missing");
 
-    // 2) Package EVERYTHING in jobDir into USDZ (textures folder, etc.)
-    // Apple expects STORE/no compression: zip -0
-    // We zip the CONTENTS of jobDir so paths inside USDZ are correct.
+    // 2) Package USDZ STRICTLY:
+    // - ONLY include: root USD + textures (.png/.jpg/.jpeg)
+    // - STORE (no compression): zip -0
+    // - Strip extra zip attributes: -X
+    // This fixes iOS "Object could not be opened" caused by extra junk/attrs.
     await run("bash", [
       "-lc",
-      `cd ${jobDir} && rm -f "${usdzPath}" && zip -0 -r "${usdzPath}" .`,
+      `
+        set -e
+        cd "${jobDir}"
+
+        test -f "${id}.usd"
+
+        rm -f "${usdzPath}"
+
+        find . -type f \\( -name "${id}.usd" -o -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \\) -print0 \\
+          | xargs -0 zip -0 -X "${usdzPath}"
+
+        echo "USDZ CONTENTS:"
+        unzip -l "${usdzPath}" || true
+      `,
     ]);
 
     if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
