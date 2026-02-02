@@ -1,4 +1,4 @@
-import bpy, sys
+import bpy, sys, os
 import addon_utils
 
 print("BLENDER VERSION:", bpy.app.version_string)
@@ -53,6 +53,13 @@ nodes.clear()
 
 tex = nodes.new("ShaderNodeTexImage")
 img = bpy.data.images.load(IMG)
+
+# ✅ CRITICAL: force a relative-ish path so USD references match what we zip
+# Without this, USD may reference an absolute path or a different filename,
+# and Quick Look shows grey because it can't find the texture inside USDZ.
+img.filepath = os.path.basename(IMG)
+img.name = os.path.basename(IMG)
+
 tex.image = img
 
 em = nodes.new("ShaderNodeEmission")
