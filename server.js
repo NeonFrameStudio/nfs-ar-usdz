@@ -24,13 +24,22 @@ fs.mkdirSync(WORK_DIR, { recursive: true });
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
+// ✅ PATCH: capture stdout/stderr so you can SEE why Blender failed
 function run(cmd, args, cwd = undefined) {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: "inherit", cwd });
-    p.on("error", reject);
-    p.on("close", (code) =>
-      code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))
-    );
+    const p = spawn(cmd, args, { cwd });
+
+    let out = "";
+    let err = "";
+
+    p.stdout?.on("data", (d) => (out += d.toString()));
+    p.stderr?.on("data", (d) => (err += d.toString()));
+
+    p.on("error", (e) => reject({ kind: "spawn_error", e, out, err }));
+    p.on("close", (code) => {
+      if (code === 0) resolve({ code, out, err });
+      else reject({ kind: "exit_code", code, out, err });
+    });
   });
 }
 
@@ -41,7 +50,8 @@ function parseDataUrl(dataUrl) {
 }
 
 async function bufferToNormalizedPng(buf, outPngPath) {
-  if (!buf || buf.length < 200) throw new Error(`image_too_small:${buf ? buf.length : 0}`);
+  if (!buf || buf.length < 200)
+    throw new Error(`image_too_small:${buf ? buf.length : 0}`);
 
   const head = buf.slice(0, 250).toString("utf8").toLowerCase();
   if (head.includes("<html") || head.includes("<!doctype html")) {
@@ -86,6 +96,9 @@ async function dataUrlAndNormalizeToPng(imageDataUrl, outPngPath) {
 }
 
 app.post("/build-usdz", async (req, res) => {
+  let jobDir = null;
+  let blenderLogs = null;
+
   try {
     const { imageUrl, imageDataUrl, widthCm, heightCm } = req.body;
 
@@ -98,7 +111,7 @@ app.post("/build-usdz", async (req, res) => {
     }
 
     const id = crypto.randomUUID();
-    const jobDir = path.join(WORK_DIR, id);
+    jobDir = path.join(WORK_DIR, id);
     fs.mkdirSync(jobDir, { recursive: true });
 
     // Keep ALL assets in jobDir so USD references can be relative
@@ -111,40 +124,76 @@ app.post("/build-usdz", async (req, res) => {
       ? await dataUrlAndNormalizeToPng(imageDataUrl, texturePath)
       : await downloadAndNormalizeToPng(imageUrl, texturePath);
 
-    // 1) Blender -> USD (writes model.usd plus exported textures into jobDir)
-    await run("blender", [
-      "-b",
-      "-P",
-      "/app/make_usd.py",
-      "--",
-      texturePath,
-      usdPath,
-      String(widthCm),
-      String(heightCm),
-    ]);
+    // 1) Blender -> USD
+    // ✅ Run Blender with cwd = jobDir to keep relative-path behavior consistent
+    blenderLogs = await run(
+      "blender",
+      [
+        "-b",
+        "-P",
+        "/app/make_usd.py",
+        "--",
+        texturePath,
+        usdPath,
+        String(widthCm),
+        String(heightCm),
+      ],
+      jobDir
+    );
 
-    if (!fs.existsSync(usdPath)) throw new Error("usd_missing");
+    if (!fs.existsSync(usdPath)) {
+      const listing = fs.existsSync(jobDir) ? fs.readdirSync(jobDir) : [];
+      throw new Error(`usd_missing (jobDir contents: ${JSON.stringify(listing)})`);
+    }
 
     // 2) Zip jobDir CONTENTS as USDZ (STORE only)
     // Important: cd into jobDir so paths inside usdz are relative.
-    await run("bash", [
-      "-lc",
-      `cd "${jobDir}" && rm -f "${usdzPath}" && zip -0 -r "${usdzPath}" .`,
-    ]);
+    const zipLogs = await run(
+      "bash",
+      ["-lc", `cd "${jobDir}" && rm -f "${usdzPath}" && zip -0 -r "${usdzPath}" .`],
+      jobDir
+    );
 
     if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
 
     return res.json({
       ok: true,
       debug: info,
+      blender: {
+        out: (blenderLogs?.out || "").slice(0, 8000),
+        err: (blenderLogs?.err || "").slice(0, 8000),
+      },
+      zip: {
+        out: (zipLogs?.out || "").slice(0, 4000),
+        err: (zipLogs?.err || "").slice(0, 4000),
+      },
       usdzUrl: `${PUBLIC_BASE_URL}/usdz/${id}.usdz`,
     });
   } catch (e) {
     console.error("BUILD_USDZ_ERROR:", e);
+
+    // if run() rejected, it will include logs
+    const logs =
+      e && (e.out || e.err || e.e)
+        ? {
+            kind: e.kind,
+            code: e.code,
+            out: (e.out || "").slice(0, 8000),
+            err: (e.err || "").slice(0, 8000),
+            spawnError: e.e ? String(e.e?.message || e.e) : null,
+          }
+        : null;
+
+    // also include jobDir listing if we have it (super useful)
+    const listing =
+      jobDir && fs.existsSync(jobDir) ? fs.readdirSync(jobDir) : null;
+
     return res.status(500).json({
       ok: false,
       reason: "server_error",
       message: String(e?.message || e),
+      logs,
+      jobDirListing: listing,
     });
   }
 });
@@ -157,6 +206,8 @@ app.use(
       if (p.endsWith(".usdz")) {
         res.setHeader("Content-Type", "model/vnd.usdz+zip");
         res.setHeader("Content-Disposition", 'inline; filename="model.usdz"');
+        // helpful for Safari/QuickLook
+        res.setHeader("Cache-Control", "no-store");
       }
     },
   })
