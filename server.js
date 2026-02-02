@@ -10,7 +10,7 @@ const app = express();
 /* --------------------------------------------------
    VERSION STAMP (so you can confirm correct deploy)
 -------------------------------------------------- */
-const SERVER_VERSION = "server.js vCORS-2026-02-03-expose";
+const SERVER_VERSION = "server.js vCORS-2026-02-03-safe-usdzip";
 
 /* --------------------------------------------------
    CONFIG
@@ -24,7 +24,7 @@ const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
 /* --------------------------------------------------
-   CORS (FINAL — includes Expose-Headers for console checkers)
+   CORS
 -------------------------------------------------- */
 
 // Extra allowlist via env (comma separated)
@@ -65,16 +65,14 @@ function isAllowedOrigin(origin) {
 function applyCors(req, res) {
   const origin = req.headers.origin;
 
-  // Always vary for caches/proxies
+  // always vary for caches/proxies
   res.setHeader("Vary", "Origin");
 
   if (isAllowedOrigin(origin)) {
     if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
 
-    // Methods supported
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
 
-    // Echo requested headers if present (critical for preflight)
     const reqHeaders = req.headers["access-control-request-headers"];
     if (reqHeaders) {
       res.setHeader("Access-Control-Allow-Headers", String(reqHeaders));
@@ -85,13 +83,6 @@ function applyCors(req, res) {
       );
     }
 
-    // Let JS read some headers (best-effort for console checkers)
-    res.setHeader(
-      "Access-Control-Expose-Headers",
-      "Content-Type, Content-Length, ETag, X-Request-Id"
-    );
-
-    // Cache preflight for 1 day
     res.setHeader("Access-Control-Max-Age", "86400");
   }
 }
@@ -102,11 +93,9 @@ app.use((req, res, next) => {
     applyCors(req, res);
   } catch {}
 
-  // Preflight must return immediately (WITH headers already set above)
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
-
   next();
 });
 
@@ -155,12 +144,35 @@ function readUsdHeader8(filePath) {
   }
 }
 
+/**
+ * SAFE runCmd:
+ * - handles "error" event (e.g. ENOENT when command doesn't exist)
+ * - always resolves (never crashes the process)
+ */
 async function runCmd(cmd, args, { cwd, timeoutMs } = {}) {
   return await new Promise((resolve) => {
-    const child = spawn(cmd, args, {
-      cwd: cwd || undefined,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    let resolved = false;
+
+    const done = (result) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(result);
+    };
+
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        cwd: cwd || undefined,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      return done({
+        ok: false,
+        code: -1,
+        out: "",
+        err: String(e?.message || e),
+      });
+    }
 
     let out = "";
     let err = "";
@@ -173,12 +185,23 @@ async function runCmd(cmd, args, { cwd, timeoutMs } = {}) {
         } catch {}
       }, timeoutMs);
 
-    child.stdout.on("data", (d) => (out += d.toString()));
-    child.stderr.on("data", (d) => (err += d.toString()));
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.stderr?.on("data", (d) => (err += d.toString()));
+
+    // 🔥 This is the missing piece: ENOENT lands here
+    child.on("error", (e) => {
+      if (timer) clearTimeout(timer);
+      done({
+        ok: false,
+        code: -1,
+        out,
+        err: (err ? err + "\n" : "") + `spawn_error: ${e?.code || ""} ${e?.message || e}`,
+      });
+    });
 
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      resolve({
+      done({
         ok: code === 0,
         code,
         out,
@@ -209,21 +232,16 @@ async function ensureUsdc(usdPath) {
 
   const outPath = usdPath.replace(/\.usd$/i, ".usdc.usd");
 
-  // Detect usdcat existence
-  const which = await runCmd("sh", ["-lc", "command -v usdcat"], {
-    timeoutMs: 8000,
-  });
+  // Detect usdcat existence safely
+  const which = await runCmd("sh", ["-lc", "command -v usdcat"], { timeoutMs: 8000 });
   if (!which.ok || !which.out.trim()) {
     result.converter = "usdcat_missing";
     return result;
   }
 
-  // Convert
-  const conv = await runCmd(
-    "sh",
-    ["-lc", `usdcat "${usdPath}" -o "${outPath}"`],
-    { timeoutMs: 30000 }
-  );
+  const conv = await runCmd("sh", ["-lc", `usdcat "${usdPath}" -o "${outPath}"`], {
+    timeoutMs: 30000,
+  });
 
   result.converter = "usdcat";
   result.converterLogs = { out: conv.out, err: conv.err };
@@ -239,9 +257,6 @@ async function ensureUsdc(usdPath) {
 
 /**
  * Fix common USD metadata that Quick Look / ARKit often expects.
- * - Ensure upAxis is Y
- * - Ensure metersPerUnit exists
- * - Ensure defaultPrim is set
  */
 async function fixUsdForQuickLook(usdPath) {
   const py = `
@@ -277,9 +292,13 @@ print("OK")
   return { ok: true, ...r };
 }
 
+/**
+ * SAFE usdzip detection:
+ * do NOT execute usdzip; just check if it's installed.
+ */
 async function hasUsdzip() {
-  const r = await runCmd("usdzip", ["--help"], { timeoutMs: 8000 });
-  return r.ok;
+  const r = await runCmd("sh", ["-lc", "command -v usdzip"], { timeoutMs: 8000 });
+  return !!(r.ok && r.out && r.out.trim());
 }
 
 async function buildUsdzWithUsdzip(outUsdzPath, usdPath, assetPaths) {
@@ -288,6 +307,7 @@ async function buildUsdzWithUsdzip(outUsdzPath, usdPath, assetPaths) {
 }
 
 async function buildUsdzWithZip(outUsdzPath, jobDir, files) {
+  // USDZ must be STORE (no compression) => zip -0
   const cmd = `cd "${jobDir}" && zip -0 -q "${outUsdzPath}" ${files
     .map((f) => `"${f}"`)
     .join(" ")}`;
@@ -317,7 +337,6 @@ app.post("/build-usdz", async (req, res) => {
     const jobDir = path.join(WORK_DIR, jobId);
     fs.mkdirSync(jobDir, { recursive: true });
 
-    // Paths inside jobDir
     const texPath = path.join(jobDir, "texture.png");
     const usdPath = path.join(jobDir, "model.usd");
     const usdzPath = path.join(jobDir, `${jobId}.usdz`);
@@ -341,28 +360,24 @@ app.post("/build-usdz", async (req, res) => {
       { timeoutMs: 120000 }
     );
 
-    if (!blender.ok) throw new Error("blender_failed");
+    if (!blender.ok) throw new Error(`blender_failed: ${blender.err || blender.out}`);
     if (!fs.existsSync(usdPath)) throw new Error("usd_missing");
 
-    // Ensure USDC if possible
+    // Best-effort USDC + metadata fixes
     const usdcCheck = await ensureUsdc(usdPath);
-
-    // Fix USD metadata (best-effort)
     const usdFix = await fixUsdForQuickLook(usdPath);
 
-    // Build USDZ (prefer usdzip; fallback zip)
+    // Build USDZ: prefer usdzip if installed, else zip -0
     let usdzBuild = { ok: false, method: null, out: "", err: "" };
 
     try {
       fs.unlinkSync(usdzPath);
     } catch {}
 
-    if (await hasUsdzip()) {
+    const canUsdzip = await hasUsdzip();
+    if (canUsdzip) {
       usdzBuild.method = "usdzip";
-      usdzBuild = {
-        ...usdzBuild,
-        ...(await buildUsdzWithUsdzip(usdzPath, usdPath, [texPath])),
-      };
+      usdzBuild = { ...usdzBuild, ...(await buildUsdzWithUsdzip(usdzPath, usdPath, [texPath])) };
     } else {
       usdzBuild.method = "zip";
       usdzBuild = {
@@ -371,7 +386,9 @@ app.post("/build-usdz", async (req, res) => {
       };
     }
 
-    if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
+    if (!fs.existsSync(usdzPath) || fileSize(usdzPath) < 32) {
+      throw new Error(`usdz_missing_or_empty (${usdzBuild.method})`);
+    }
 
     const publicUsdzUrl = `${PUBLIC_BASE_URL}/usdz/${jobId}/${jobId}.usdz`;
     const jobDirListing = fs.readdirSync(jobDir);
@@ -382,22 +399,22 @@ app.post("/build-usdz", async (req, res) => {
       usdzUrl: publicUsdzUrl,
       debug: {
         serverVersion: SERVER_VERSION,
-        source: "url",
         imageUrl,
         bytesIn: imgBuf.length,
         bytesOut: fileSize(usdzPath),
       },
       blender: {
+        ok: blender.ok,
         out: blender.out.slice(0, 4000),
         err: blender.err.slice(0, 4000),
       },
       usd: usdcCheck,
       usdFix,
       usdzBuild: {
-        method: usdzBuild?.method || null,
-        ok: !!usdzBuild?.ok,
-        out: (usdzBuild?.out || "").slice(0, 8000),
-        err: (usdzBuild?.err || "").slice(0, 8000),
+        method: usdzBuild.method,
+        ok: !!usdzBuild.ok,
+        out: (usdzBuild.out || "").slice(0, 8000),
+        err: (usdzBuild.err || "").slice(0, 8000),
       },
       jobDirListing,
     });
@@ -419,9 +436,7 @@ app.get("/usdz/:jobId/:file", (req, res) => {
   try {
     const { jobId, file } = req.params;
 
-    if (file !== `${jobId}.usdz`) {
-      return res.status(404).send("not_found");
-    }
+    if (file !== `${jobId}.usdz`) return res.status(404).send("not_found");
 
     const p = path.join(WORK_DIR, jobId, file);
     if (!fs.existsSync(p)) return res.status(404).send("not_found");
@@ -450,7 +465,7 @@ app.get("/", (req, res) => {
 });
 
 /* --------------------------------------------------
-   ERROR HANDLER (keeps CORS on unexpected failures)
+   ERROR HANDLER
 -------------------------------------------------- */
 
 app.use((err, req, res, next) => {
