@@ -10,7 +10,7 @@ const app = express();
 /* --------------------------------------------------
    VERSION STAMP (so you can confirm correct deploy)
 -------------------------------------------------- */
-const SERVER_VERSION = "server.js vCORS-2026-02-03b";
+const SERVER_VERSION = "server.js vCORS-2026-02-03-expose";
 
 /* --------------------------------------------------
    CONFIG
@@ -23,17 +23,8 @@ fs.mkdirSync(WORK_DIR, { recursive: true });
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
-/**
- * IMPORTANT:
- * Shopify/Chrome sometimes sends OPTIONS without an Origin header.
- * Your screenshot shows ACAO: null => browser blocks POST.
- *
- * So we must pick a safe fallback origin to respond with on OPTIONS.
- */
-const FALLBACK_ORIGIN = "https://www.neonframestudio.com";
-
 /* --------------------------------------------------
-   CORS (LATEST FIX — handles missing Origin on OPTIONS)
+   CORS (FINAL — includes Expose-Headers for console checkers)
 -------------------------------------------------- */
 
 // Extra allowlist via env (comma separated)
@@ -77,37 +68,32 @@ function applyCors(req, res) {
   // Always vary for caches/proxies
   res.setHeader("Vary", "Origin");
 
-  // Only apply CORS if origin is allowed (or missing — treated as allowed)
-  if (!isAllowedOrigin(origin)) return;
+  if (isAllowedOrigin(origin)) {
+    if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
 
-  /**
-   * ✅ CRITICAL FIX:
-   * If Origin is missing (common on some preflights),
-   * still send ACAO using a safe fallback storefront origin,
-   * otherwise Chrome logs ACAO:null and blocks.
-   */
-  const allowOrigin = origin || FALLBACK_ORIGIN;
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+    // Methods supported
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
 
-  // Methods supported
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
+    // Echo requested headers if present (critical for preflight)
+    const reqHeaders = req.headers["access-control-request-headers"];
+    if (reqHeaders) {
+      res.setHeader("Access-Control-Allow-Headers", String(reqHeaders));
+    } else {
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, X-Requested-With"
+      );
+    }
 
-  // Echo requested headers if present (critical for preflight)
-  const reqHeaders = req.headers["access-control-request-headers"];
-  if (reqHeaders) {
-    res.setHeader("Access-Control-Allow-Headers", String(reqHeaders));
-  } else {
+    // Let JS read some headers (best-effort for console checkers)
     res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With"
+      "Access-Control-Expose-Headers",
+      "Content-Type, Content-Length, ETag, X-Request-Id"
     );
+
+    // Cache preflight for 1 day
+    res.setHeader("Access-Control-Max-Age", "86400");
   }
-
-  // Cache preflight for 1 day
-  res.setHeader("Access-Control-Max-Age", "86400");
-
-  // If you ever move to cookies/sessions, you can enable this:
-  // res.setHeader("Access-Control-Allow-Credentials", "true");
 }
 
 // Global CORS middleware (runs BEFORE body parsing)
@@ -389,7 +375,6 @@ app.post("/build-usdz", async (req, res) => {
 
     const publicUsdzUrl = `${PUBLIC_BASE_URL}/usdz/${jobId}/${jobId}.usdz`;
     const jobDirListing = fs.readdirSync(jobDir);
-    const usdzListing = `Archive: ${usdzPath}`;
 
     return res.json({
       ok: true,
@@ -414,11 +399,9 @@ app.post("/build-usdz", async (req, res) => {
         out: (usdzBuild?.out || "").slice(0, 8000),
         err: (usdzBuild?.err || "").slice(0, 8000),
       },
-      usdzListing,
       jobDirListing,
     });
   } catch (err) {
-    // IMPORTANT: CORS headers should still be present (global middleware already ran)
     return res.status(500).json({
       ok: false,
       requestId,
