@@ -1,12 +1,9 @@
-import bpy, sys, os, math
+import bpy, sys, os, shutil, subprocess
 import addon_utils
 
 def log(*a):
     print("[make_usd]", *a)
 
-# ------------------------------------------------------------
-# Args
-# ------------------------------------------------------------
 argv = sys.argv[sys.argv.index("--") + 1:]
 IMG, USD, W, H = argv
 
@@ -18,16 +15,16 @@ DEPTH = 0.015  # 1.5cm thickness (AR-safe)
 
 log("IMG:", IMG)
 log("USD:", USD)
-log("W,H(m):", W, H, "DEPTH(m):", DEPTH)
+log("W,H(m):", W, H)
+log("DEPTH(m):", DEPTH)
 
-# ------------------------------------------------------------
-# Reset to empty scene
-# ------------------------------------------------------------
+job_dir = os.path.dirname(os.path.abspath(USD))
+tex_path = os.path.join(job_dir, "texture.png")
+
+# Reset Blender
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
-# ------------------------------------------------------------
-# Try enable USD addon if present (safe)
-# ------------------------------------------------------------
+# Enable USD addon if present
 def enable_usd_addon():
     for mod in ("io_scene_usd", "usd", "io_usd"):
         try:
@@ -43,72 +40,50 @@ def enable_usd_addon():
 
 enable_usd_addon()
 
-# ------------------------------------------------------------
-# Root object (gives clean root prim)
-# ------------------------------------------------------------
-root = bpy.data.objects.new("Root", None)
-bpy.context.collection.objects.link(root)
-bpy.context.view_layer.objects.active = root
+# Ensure we have texture.png in the same directory as the USD output
+try:
+    if os.path.abspath(IMG) != os.path.abspath(tex_path):
+        shutil.copyfile(IMG, tex_path)
+        log("Copied IMG to texture.png:", tex_path)
+    else:
+        log("IMG already is texture.png:", tex_path)
+except Exception as e:
+    log("FAILED copying IMG -> texture.png:", e)
+    raise
 
-# ------------------------------------------------------------
-# Create AR-safe geometry: THIN BOX (not a plane)
-# ------------------------------------------------------------
+# Create a thin box (NOT a plane)
 bpy.ops.mesh.primitive_cube_add(size=1)
 obj = bpy.context.active_object
 obj.name = "NFS_Frame"
 
-# Scale in meters (cube size=1)
+# Scale cube to match requested size
 obj.scale = (W / 2.0, H / 2.0, DEPTH / 2.0)
 
-# Parent to root
-obj.parent = root
-obj.matrix_parent_inverse = root.matrix_world.inverted()
+# Apply transforms so exported mesh has real dimensions baked in
+bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
 
-# ------------------------------------------------------------
-# CRITICAL: Convert Blender Z-up -> Y-up for ARKit
-# Rotate -90° around X, then APPLY rotation+scale
-# ------------------------------------------------------------
-obj.rotation_euler = (math.radians(-90.0), 0.0, 0.0)
-
-# Move it slightly forward so it’s not centered through origin
-# (helps AR placement / avoids weird “flat at origin” edge cases)
-obj.location = (0.0, 0.0, DEPTH / 2.0)
-
-# Apply transforms (ARKit is picky about unapplied transforms)
-bpy.context.view_layer.objects.active = obj
-bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-
-# ------------------------------------------------------------
-# Ensure UVs exist (critical for textures in AR)
-# ------------------------------------------------------------
+# Ensure normals are correct (helps AR)
 try:
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
-    bpy.ops.object.mode_set(mode="OBJECT")
-    log("UV unwrap: OK")
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    bpy.ops.object.mode_set(mode='OBJECT')
 except Exception as e:
-    try:
-        bpy.ops.object.mode_set(mode="OBJECT")
-    except Exception:
-        pass
-    log("UV unwrap failed (continuing):", e)
+    log("Normals fix skipped:", e)
 
-# ------------------------------------------------------------
-# Material with RELATIVE texture reference: "texture.png"
-# ------------------------------------------------------------
+# Material with texture
 mat = bpy.data.materials.new("NFS_Mat")
 mat.use_nodes = True
 nodes = mat.node_tree.nodes
 links = mat.node_tree.links
 nodes.clear()
 
-tex = nodes.new("ShaderNodeTexImage")
-tex.location = (-500, 0)
+tex_node = nodes.new("ShaderNodeTexImage")
+tex_node.location = (-500, 0)
 
-img = bpy.data.images.load(IMG)
+# IMPORTANT: Load *texture.png from job dir*
+img = bpy.data.images.load(tex_path)
 
-# Force referenced path INSIDE USD to exactly "texture.png"
+# CRITICAL: Force USD to reference just "texture.png" (relative)
 img.filepath = "texture.png"
 img.filepath_raw = "texture.png"
 
@@ -117,24 +92,25 @@ try:
 except Exception:
     pass
 
-tex.image = img
+tex_node.image = img
+
+# Use UVs explicitly (sometimes helps exporter consistency)
+uv_node = nodes.new("ShaderNodeTexCoord")
+uv_node.location = (-750, 0)
+links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
 
 bsdf = nodes.new("ShaderNodeBsdfPrincipled")
 bsdf.location = (-150, 0)
 
-# Base color
-links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+# Make it visible in AR
+if "Emission" in bsdf.inputs:
+    links.new(tex_node.outputs["Color"], bsdf.inputs["Emission"])
+if "Emission Strength" in bsdf.inputs:
+    bsdf.inputs["Emission Strength"].default_value = 1.0
+if "Roughness" in bsdf.inputs:
+    bsdf.inputs["Roughness"].default_value = 0.35
 
-# A touch of emissive pop (optional)
-try:
-    if "Emission" in bsdf.inputs:
-        links.new(tex.outputs["Color"], bsdf.inputs["Emission"])
-    if "Emission Strength" in bsdf.inputs:
-        bsdf.inputs["Emission Strength"].default_value = 0.8
-    if "Roughness" in bsdf.inputs:
-        bsdf.inputs["Roughness"].default_value = 0.35
-except Exception as e:
-    log("BSDF tuning warn:", e)
+links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
 
 out = nodes.new("ShaderNodeOutputMaterial")
 out.location = (250, 0)
@@ -143,12 +119,11 @@ links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 obj.data.materials.clear()
 obj.data.materials.append(mat)
 
-# ------------------------------------------------------------
-# Export USD (do NOT pass export_format — your Blender rejected it)
-# ------------------------------------------------------------
+# Export USD
 if not hasattr(bpy.ops.wm, "usd_export"):
     raise RuntimeError("bpy.ops.wm.usd_export not available in this Blender build")
 
+# Only pass supported args (Blender varies by version)
 props = set()
 try:
     props = set(bpy.ops.wm.usd_export.get_rna_type().properties.keys())
@@ -160,33 +135,42 @@ kwargs = {
     "export_materials": True,
 }
 
-if "export_textures" in props:
-    kwargs["export_textures"] = False
-
+# Prefer exporter writing relative refs if supported
 if "relative_paths" in props:
     kwargs["relative_paths"] = True
 
-log("usd_export kwargs:", kwargs)
+# We package texture.png ourselves — do not let Blender relocate unless you want it
+if "export_textures" in props:
+    kwargs["export_textures"] = False
 
+# Force USDC if supported
+if "export_format" in props:
+    kwargs["export_format"] = "USDC"
+
+# Some Blender builds have these:
+if "export_uvmaps" in props:
+    kwargs["export_uvmaps"] = True
+if "export_normals" in props:
+    kwargs["export_normals"] = True
+
+log("usd_export kwargs:", kwargs)
 bpy.ops.wm.usd_export(**kwargs)
 
-# ------------------------------------------------------------
 # Validate output
-# ------------------------------------------------------------
 if not os.path.exists(USD):
-    base = os.path.dirname(USD)
-    listing = os.listdir(base) if os.path.isdir(base) else "missing dir"
-    log("USD NOT CREATED. Dir listing:", base, listing)
+    log("USD NOT CREATED. Dir listing:", job_dir, os.listdir(job_dir))
     raise RuntimeError("usd_not_created")
 
-size = os.path.getsize(USD)
-log("USD created OK:", USD, "bytes:", size)
+log("USD created OK:", USD, "bytes:", os.path.getsize(USD))
 
-# Print first 8 bytes (helps confirm USDC in server logs)
+# EXTRA DIAGNOSTIC: show any texture references embedded in the USD
 try:
-    with open(USD, "rb") as f:
-        h = f.read(8)
-    log("USD header (8 bytes) ascii:", "".join([chr(b) if 32 <= b <= 126 else "." for b in h]))
-    log("USD header (8 bytes) hex:", h.hex())
+    out = subprocess.check_output(["strings", USD], stderr=subprocess.STDOUT).decode("utf-8", "ignore")
+    hits = []
+    for line in out.splitlines():
+        low = line.lower()
+        if "png" in low or "texture" in low or "/tmp/" in low or "textures/" in low:
+            hits.append(line[:300])
+    log("USD strings hits:", hits[:50])
 except Exception as e:
-    log("USD header read failed:", e)
+    log("strings diagnostic skipped:", e)
