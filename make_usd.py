@@ -10,14 +10,18 @@ H = float(H) / 100.0
 # ---------- Reset scene ----------
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
-# ---------- Enable USD exporter addon if present ----------
+# ---------- Enable USD exporter addon ----------
 def enable_usd_addon():
     candidates = ["io_scene_usd", "usd", "io_usd"]
     for mod in candidates:
         try:
+            # check() returns (enabled, loaded) in most builds
             state = addon_utils.check(mod)
-            if state[0] is not None:
-                bpy.ops.preferences.addon_enable(module=mod)
+            if state and state[0] is not None:
+                try:
+                    addon_utils.enable(mod, default_set=True)
+                except Exception:
+                    bpy.ops.preferences.addon_enable(module=mod)
                 return mod
         except Exception:
             pass
@@ -31,6 +35,13 @@ p = bpy.context.active_object
 p.scale = (W / 2.0, H / 2.0, 1.0)
 p.name = "NFS_Plane"
 
+# ✅ CRITICAL: give it THICKNESS (Quick Look hates “infinitely thin” meshes)
+bpy.context.view_layer.objects.active = p
+bpy.ops.object.modifier_add(type="SOLIDIFY")
+p.modifiers["Solidify"].thickness = 0.002  # 2mm
+p.modifiers["Solidify"].offset = 0.0
+bpy.ops.object.modifier_apply(modifier="Solidify")
+
 # ---------- Material (AR-friendly) ----------
 mat = bpy.data.materials.new("NFS_Mat")
 mat.use_nodes = True
@@ -43,12 +54,10 @@ for n in list(nodes):
 tex = nodes.new("ShaderNodeTexImage")
 tex.location = (-400, 0)
 
-# Load the PNG you already created: jobDir/texture.png
+# Load texture.png from jobDir
 img = bpy.data.images.load(IMG)
 
-# ✅ CRITICAL:
-# Force the image path to be just "texture.png" (relative),
-# so the USD references it correctly INSIDE the USDZ.
+# ✅ Force reference inside USD to be just "texture.png"
 base_name = os.path.basename(IMG)
 img.filepath = base_name
 img.filepath_raw = base_name
@@ -69,11 +78,11 @@ out.location = (200, 0)
 
 links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
 
-# Small emission so it pops
+# Optional small emission so it pops a bit
 if "Emission" in bsdf.inputs:
     links.new(tex.outputs["Color"], bsdf.inputs["Emission"])
 if "Emission Strength" in bsdf.inputs:
-    bsdf.inputs["Emission Strength"].default_value = 0.8
+    bsdf.inputs["Emission Strength"].default_value = 0.35
 
 if "Roughness" in bsdf.inputs:
     bsdf.inputs["Roughness"].default_value = 0.35
@@ -87,8 +96,7 @@ p.data.materials.append(mat)
 if not hasattr(bpy.ops.wm, "usd_export"):
     raise RuntimeError(f"bpy.ops.wm.usd_export not found. USD addon enabled: {enabled}")
 
-# Only pass args supported by this Blender build
-props = set()
+# Detect supported args (Blender build differences)
 try:
     props = set(bpy.ops.wm.usd_export.get_rna_type().properties.keys())
 except Exception:
@@ -99,22 +107,16 @@ kwargs = {
     "export_materials": True,
 }
 
-# ✅ IMPORTANT:
-# Do NOT export textures; we already have texture.png and we forced the USD to point to it.
+# ✅ IMPORTANT: do NOT export textures — we ship texture.png ourselves
 if "export_textures" in props:
     kwargs["export_textures"] = False
 
-# ✅ Relative paths so it references "texture.png"
+# ✅ IMPORTANT: keep relative paths so USD references "texture.png"
 if "relative_paths" in props:
     kwargs["relative_paths"] = True
 
-# Prefer ASCII (easier/safer)
-if "export_format" in props:
-    # Blender often expects: 'USD', 'USDA', 'USDC' depending on build
-    # We'll try the common "USDA" first, fallback if it errors.
-    try:
-        kwargs["export_format"] = "USDA"
-    except Exception:
-        pass
+# Good to include UVs if supported
+if "export_uvmaps" in props:
+    kwargs["export_uvmaps"] = True
 
 bpy.ops.wm.usd_export(**kwargs)
