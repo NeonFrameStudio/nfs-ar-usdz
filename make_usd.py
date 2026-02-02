@@ -1,6 +1,9 @@
 import bpy, sys
 import addon_utils
 
+print("BLENDER VERSION:", bpy.app.version_string)
+print("HAS USD EXPORT (pre):", hasattr(bpy.ops.wm, "usd_export"))
+
 argv = sys.argv[sys.argv.index("--")+1:]
 IMG, USD, W, H = argv
 
@@ -13,18 +16,28 @@ bpy.ops.wm.read_factory_settings(use_empty=True)
 # ---- IMPORTANT: enable USD addon (needed for wm.usd_export in many builds) ----
 def enable_usd_addon():
   candidates = ["io_scene_usd", "usd", "io_usd"]
-  last_err = None
+  found = []
   for mod in candidates:
     try:
-      # If present, enable it
-      if addon_utils.check(mod)[0] is not None:
-        bpy.ops.preferences.addon_enable(module=mod)
-        return mod
-    except Exception as e:
-      last_err = e
-  raise RuntimeError(f"USD addon not available/enabled. Tried {candidates}. Last error: {last_err}")
+      state = addon_utils.check(mod)
+      if state[0] is not None:
+        found.append(mod)
+    except:
+      pass
+
+  if not found:
+    raise RuntimeError(
+      f"USD addon not present in this Blender build. Tried {candidates}. "
+      f"Install official Blender (not apt)."
+    )
+
+  bpy.ops.preferences.addon_enable(module=found[0])
+  return found[0]
 
 enabled = enable_usd_addon()
+
+print("USD ADDON ENABLED:", enabled)
+print("HAS USD EXPORT (post):", hasattr(bpy.ops.wm, "usd_export"))
 
 # Plane
 bpy.ops.mesh.primitive_plane_add(size=1)
@@ -51,7 +64,6 @@ links.new(em.outputs["Emission"], out.inputs["Surface"])
 p.data.materials.append(mat)
 
 # Export USD
-# (Keep USD + PNG, server zips into USDZ)
 if not hasattr(bpy.ops.wm, "usd_export"):
   raise RuntimeError(f"bpy.ops.wm.usd_export not found even after enabling addon: {enabled}")
 
