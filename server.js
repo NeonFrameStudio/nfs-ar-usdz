@@ -7,7 +7,7 @@ import { spawn } from "child_process";
 import sharp from "sharp";
 
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 // CORS
 app.use((req, res, next) => {
@@ -41,15 +41,14 @@ function parseDataUrl(dataUrl) {
 }
 
 async function bufferToNormalizedPng(buf, outPngPath) {
-  if (!buf || buf.length < 200) {
-    throw new Error(`image_too_small:${buf ? buf.length : 0}`);
-  }
+  if (!buf || buf.length < 200) throw new Error(`image_too_small:${buf ? buf.length : 0}`);
 
-  const head = buf.slice(0, 200).toString("utf8").toLowerCase();
+  const head = buf.slice(0, 250).toString("utf8").toLowerCase();
   if (head.includes("<html") || head.includes("<!doctype html")) {
-    throw new Error(`image_is_html_not_image`);
+    throw new Error("image_is_html_not_image");
   }
 
+  // Normalize to PNG (removes weird encodings + guarantees alpha handling)
   const png = await sharp(buf, { failOnError: true })
     .png({ compressionLevel: 9 })
     .toBuffer();
@@ -69,7 +68,7 @@ async function downloadAndNormalizeToPng(imageUrl, outPngPath) {
 
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
-    throw new Error(`image_download_failed:${r.status}:${txt.slice(0, 120)}`);
+    throw new Error(`image_download_failed:${r.status}:${txt.slice(0, 160)}`);
   }
 
   const buf = Buffer.from(await r.arrayBuffer());
@@ -89,6 +88,7 @@ async function dataUrlAndNormalizeToPng(imageDataUrl, outPngPath) {
 app.post("/build-usdz", async (req, res) => {
   try {
     const { imageUrl, imageDataUrl, widthCm, heightCm } = req.body;
+
     if ((!imageUrl && !imageDataUrl) || !widthCm || !heightCm) {
       return res.status(400).json({
         ok: false,
@@ -98,22 +98,20 @@ app.post("/build-usdz", async (req, res) => {
     }
 
     const id = crypto.randomUUID();
-
-    // ✅ Use a per-job folder so Blender outputs + textures stay together
     const jobDir = path.join(WORK_DIR, id);
     fs.mkdirSync(jobDir, { recursive: true });
 
-    // ✅ Deterministic names (Quick Look + packaging stability)
-    const texturePath = path.join(jobDir, `${id}.png`);
-    const usdPath = path.join(jobDir, `${id}.usd`);
+    // Keep ALL assets in jobDir so USD references can be relative
+    const texturePath = path.join(jobDir, "texture.png");
+    const usdPath = path.join(jobDir, "model.usd");
     const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
 
-    // 0) Get normalized PNG -> jobDir/<id>.png
+    // 0) Prepare normalized PNG
     const info = imageDataUrl
       ? await dataUrlAndNormalizeToPng(imageDataUrl, texturePath)
       : await downloadAndNormalizeToPng(imageUrl, texturePath);
 
-    // 1) Blender -> USD (flat plane w/ texture)
+    // 1) Blender -> USD (writes model.usd plus exported textures into jobDir)
     await run("blender", [
       "-b",
       "-P",
@@ -127,27 +125,11 @@ app.post("/build-usdz", async (req, res) => {
 
     if (!fs.existsSync(usdPath)) throw new Error("usd_missing");
 
-    // 2) Package USDZ STRICTLY:
-    // - ONLY include: root USD + textures (.png/.jpg/.jpeg)
-    // - STORE (no compression): zip -0
-    // - Strip extra zip attributes: -X
-    // This fixes iOS "Object could not be opened" caused by extra junk/attrs.
+    // 2) Zip jobDir CONTENTS as USDZ (STORE only)
+    // Important: cd into jobDir so paths inside usdz are relative.
     await run("bash", [
       "-lc",
-      `
-        set -e
-        cd "${jobDir}"
-
-        test -f "${id}.usd"
-
-        rm -f "${usdzPath}"
-
-        find . -type f \\( -name "${id}.usd" -o -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \\) -print0 \\
-          | xargs -0 zip -0 -X "${usdzPath}"
-
-        echo "USDZ CONTENTS:"
-        unzip -l "${usdzPath}" || true
-      `,
+      `cd "${jobDir}" && rm -f "${usdzPath}" && zip -0 -r "${usdzPath}" .`,
     ]);
 
     if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
@@ -180,6 +162,7 @@ app.use(
   })
 );
 
+// Healthcheck
 app.get("/", (req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3000;
