@@ -10,7 +10,7 @@ const app = express();
 /* --------------------------------------------------
    VERSION STAMP (so you can confirm correct deploy)
 -------------------------------------------------- */
-const SERVER_VERSION = "server.js vCORS-2026-02-03";
+const SERVER_VERSION = "server.js vCORS-2026-02-03b";
 
 /* --------------------------------------------------
    CONFIG
@@ -23,22 +23,18 @@ fs.mkdirSync(WORK_DIR, { recursive: true });
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
-/* --------------------------------------------------
-   CORS (ACTUAL FIX — matches your screenshot issue)
--------------------------------------------------- */
-
 /**
- * Your browser is doing:
- * 1) OPTIONS /build-usdz (preflight)
- * 2) POST /build-usdz (real request)
+ * IMPORTANT:
+ * Shopify/Chrome sometimes sends OPTIONS without an Origin header.
+ * Your screenshot shows ACAO: null => browser blocks POST.
  *
- * Your screenshot shows:
- * OPTIONS 204 but ACAO/ACAH are null => browser blocks POST.
- *
- * Fix:
- * - Always return ACAO + ACAH + ACAM on OPTIONS when origin is allowed
- * - Keep CORS headers on error responses too
+ * So we must pick a safe fallback origin to respond with on OPTIONS.
  */
+const FALLBACK_ORIGIN = "https://www.neonframestudio.com";
+
+/* --------------------------------------------------
+   CORS (LATEST FIX — handles missing Origin on OPTIONS)
+-------------------------------------------------- */
 
 // Extra allowlist via env (comma separated)
 const EXTRA_ALLOWED_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || "")
@@ -78,33 +74,40 @@ function isAllowedOrigin(origin) {
 function applyCors(req, res) {
   const origin = req.headers.origin;
 
-  // always vary for caches/proxies
+  // Always vary for caches/proxies
   res.setHeader("Vary", "Origin");
 
-  // If allowed, reflect origin (DON’T use "*")
-  if (isAllowedOrigin(origin)) {
-    if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+  // Only apply CORS if origin is allowed (or missing — treated as allowed)
+  if (!isAllowedOrigin(origin)) return;
 
-    // Methods supported
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
+  /**
+   * ✅ CRITICAL FIX:
+   * If Origin is missing (common on some preflights),
+   * still send ACAO using a safe fallback storefront origin,
+   * otherwise Chrome logs ACAO:null and blocks.
+   */
+  const allowOrigin = origin || FALLBACK_ORIGIN;
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
 
-    // Echo requested headers if present (critical for preflight)
-    const reqHeaders = req.headers["access-control-request-headers"];
-    if (reqHeaders) {
-      res.setHeader("Access-Control-Allow-Headers", String(reqHeaders));
-    } else {
-      res.setHeader(
-        "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-Requested-With"
-      );
-    }
+  // Methods supported
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
 
-    // Cache preflight for 1 day
-    res.setHeader("Access-Control-Max-Age", "86400");
-
-    // If you ever move to cookies/sessions, you can enable this
-    // res.setHeader("Access-Control-Allow-Credentials", "true");
+  // Echo requested headers if present (critical for preflight)
+  const reqHeaders = req.headers["access-control-request-headers"];
+  if (reqHeaders) {
+    res.setHeader("Access-Control-Allow-Headers", String(reqHeaders));
+  } else {
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With"
+    );
   }
+
+  // Cache preflight for 1 day
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  // If you ever move to cookies/sessions, you can enable this:
+  // res.setHeader("Access-Control-Allow-Credentials", "true");
 }
 
 // Global CORS middleware (runs BEFORE body parsing)
