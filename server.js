@@ -260,8 +260,8 @@ async function ensureUsdc(usdPath) {
  */
 async function fixUsdForQuickLook(usdPath) {
   const py = `
-from pxr import Usd, UsdGeom
-import sys
+from pxr import Usd, UsdGeom, Sdf, UsdShade
+import sys, os
 
 path = sys.argv[1]
 stage = Usd.Stage.Open(path)
@@ -269,6 +269,7 @@ if not stage:
   print("ERR: cannot open", path)
   sys.exit(2)
 
+# ---- Core Quick Look expectations ----
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
 
 try:
@@ -282,9 +283,60 @@ if not default:
   if kids:
     stage.SetDefaultPrim(kids[0])
 
+# ---- FIX TEXTURE PATHS (critical) ----
+# Make any asset path pointing to a PNG/JPG resolve to just the basename
+# e.g. /tmp/ar/.../texture.png -> texture.png
+for prim in stage.Traverse():
+  for attr in prim.GetAttributes():
+    tn = attr.GetTypeName()
+    try:
+      # Single asset
+      if tn == Sdf.ValueTypeNames.Asset:
+        v = attr.Get()
+        if v and hasattr(v, "path"):
+          p = v.path or ""
+          low = p.lower()
+          if low.endswith((".png",".jpg",".jpeg",".webp")):
+            attr.Set(Sdf.AssetPath(os.path.basename(p)))
+      # Array of assets
+      elif tn == Sdf.ValueTypeNames.AssetArray:
+        arr = attr.Get() or []
+        out = []
+        changed = False
+        for v in arr:
+          p = v.path if hasattr(v,"path") else str(v)
+          low = (p or "").lower()
+          if low.endswith((".png",".jpg",".jpeg",".webp")):
+            out.append(Sdf.AssetPath(os.path.basename(p)))
+            changed = True
+          else:
+            out.append(v)
+        if changed:
+          attr.Set(out)
+    except Exception:
+      pass
+
+# ---- AUTO SCALE FIX (if it came out tiny) ----
+# If the bbox longest side is < 0.1m, scale it up by 100.
+try:
+  default = stage.GetDefaultPrim()
+  if default:
+    root = UsdGeom.Xformable(default)
+    cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+    bbox = cache.ComputeWorldBound(default).ComputeAlignedBox()
+    size = bbox.GetSize()
+    longest = max(size[0], size[1], size[2])
+    if longest > 0 and longest < 0.10:
+      # add a scale op (100x)
+      s = root.AddScaleOp()
+      s.Set((100.0, 100.0, 100.0))
+except Exception as e:
+  print("scale_fix_skipped", e)
+
 stage.Save()
 print("OK")
 `;
+
   const r = await runCmd("python3", ["-c", py, usdPath], { timeoutMs: 20000 });
   if (!r.ok) {
     return { ok: false, note: "pxr_python_missing_or_failed", ...r };
