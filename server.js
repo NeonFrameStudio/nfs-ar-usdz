@@ -34,27 +34,20 @@ function run(cmd, args) {
   });
 }
 
-async function downloadAndNormalizeToPng(imageUrl, outPngPath) {
-  const r = await fetch(imageUrl, {
-    redirect: "follow",
-    headers: {
-      // Some CDNs block "no UA" fetches
-      "User-Agent": "Mozilla/5.0 (NFS-AR-Bot)",
-      "Accept": "image/*,*/*;q=0.8",
-    },
-  });
+// -----------------------------
+// Helpers
+// -----------------------------
 
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`image_download_failed:${r.status}:${txt.slice(0, 120)}`);
-  }
+function parseDataUrl(dataUrl) {
+  // data:image/png;base64,XXXX
+  const m = String(dataUrl || "").match(/^data:([^;]+);base64,(.+)$/i);
+  if (!m) return null;
+  return { mime: m[1], b64: m[2] };
+}
 
-  const contentType = (r.headers.get("content-type") || "").toLowerCase();
-  const buf = Buffer.from(await r.arrayBuffer());
-
-  // Quick sanity checks
-  if (buf.length < 200) {
-    throw new Error(`image_too_small:${buf.length}`);
+async function bufferToNormalizedPng(buf, outPngPath) {
+  if (!buf || buf.length < 200) {
+    throw new Error(`image_too_small:${buf ? buf.length : 0}`);
   }
 
   // If it’s HTML, it’s not an image (blocked/expired/redirect page)
@@ -63,22 +56,56 @@ async function downloadAndNormalizeToPng(imageUrl, outPngPath) {
     throw new Error(`image_is_html_not_image`);
   }
 
-  // Convert ANYTHING (jpg/webp/png) into a guaranteed valid PNG
-  // This fixes the exact “does not have any image data” Blender crash.
+  // Convert ANYTHING to a guaranteed valid PNG
   const png = await sharp(buf, { failOnError: true })
     .png({ compressionLevel: 9 })
     .toBuffer();
 
   fs.writeFileSync(outPngPath, png);
-
-  return { contentType, bytesIn: buf.length, bytesOut: png.length };
+  return { bytesIn: buf.length, bytesOut: png.length };
 }
 
+async function downloadAndNormalizeToPng(imageUrl, outPngPath) {
+  const r = await fetch(imageUrl, {
+    redirect: "follow",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (NFS-AR-Bot)",
+      Accept: "image/*,*/*;q=0.8",
+    },
+  });
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`image_download_failed:${r.status}:${txt.slice(0, 120)}`);
+  }
+
+  const buf = Buffer.from(await r.arrayBuffer());
+  const info = await bufferToNormalizedPng(buf, outPngPath);
+  return { source: "url", imageUrl, ...info };
+}
+
+async function dataUrlAndNormalizeToPng(imageDataUrl, outPngPath) {
+  const parsed = parseDataUrl(imageDataUrl);
+  if (!parsed) throw new Error("invalid_imageDataUrl");
+
+  const buf = Buffer.from(parsed.b64, "base64");
+  const info = await bufferToNormalizedPng(buf, outPngPath);
+  return { source: "dataUrl", mime: parsed.mime, ...info };
+}
+
+// -----------------------------
+// Route
+// -----------------------------
 app.post("/build-usdz", async (req, res) => {
   try {
-    const { imageUrl, widthCm, heightCm } = req.body;
-    if (!imageUrl || !widthCm || !heightCm) {
-      return res.status(400).json({ ok: false, reason: "missing_params" });
+    const { imageUrl, imageDataUrl, widthCm, heightCm } = req.body;
+
+    if ((!imageUrl && !imageDataUrl) || !widthCm || !heightCm) {
+      return res.status(400).json({
+        ok: false,
+        reason: "missing_params",
+        need: "imageUrl OR imageDataUrl + widthCm + heightCm",
+      });
     }
 
     const id = crypto.randomUUID();
@@ -86,7 +113,10 @@ app.post("/build-usdz", async (req, res) => {
     const usdPath = path.join(WORK_DIR, `${id}.usd`);
     const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
 
-    const info = await downloadAndNormalizeToPng(imageUrl, pngPath);
+    // 0) get PNG
+    const info = imageDataUrl
+      ? await dataUrlAndNormalizeToPng(imageDataUrl, pngPath)
+      : await downloadAndNormalizeToPng(imageUrl, pngPath);
 
     // 1) Blender -> USD (flat plane w/ texture)
     await run("blender", [
@@ -100,20 +130,15 @@ app.post("/build-usdz", async (req, res) => {
       String(heightCm),
     ]);
 
-    if (!fs.existsSync(usdPath)) {
-      throw new Error("usd_missing");
-    }
+    if (!fs.existsSync(usdPath)) throw new Error("usd_missing");
 
-    // 2) Package USD + PNG into USDZ (USDZ is just a zip with STORE/no compression)
-    // Apple expects no compression: zip -0
+    // 2) Package USD + PNG into USDZ
     await run("bash", [
       "-lc",
       `cd ${WORK_DIR} && rm -f ${id}.usdz && zip -0 ${id}.usdz ${id}.usd ${id}.png`,
     ]);
 
-    if (!fs.existsSync(usdzPath)) {
-      throw new Error("usdz_missing");
-    }
+    if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
 
     return res.json({
       ok: true,
@@ -135,12 +160,17 @@ app.use(
   "/usdz",
   express.static(WORK_DIR, {
     setHeaders(res, p) {
-      if (p.endsWith(".usdz")) res.setHeader("Content-Type", "model/vnd.usdz+zip");
+      if (p.endsWith(".usdz")) {
+        res.setHeader("Content-Type", "model/vnd.usdz+zip");
+        res.setHeader("Content-Disposition", 'inline; filename="model.usdz"');
+      }
       if (p.endsWith(".usd")) res.setHeader("Content-Type", "application/octet-stream");
       if (p.endsWith(".png")) res.setHeader("Content-Type", "image/png");
     },
   })
 );
+
+app.get("/", (req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("USDZ server running on port", PORT));
