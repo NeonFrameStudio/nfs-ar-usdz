@@ -20,17 +20,83 @@ const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
 /* --------------------------------------------------
+   CORS (FIX)
+-------------------------------------------------- */
+
+/**
+ * Why this is required:
+ * Your Shopify site (https://www.neonframestudio.com) calls this API cross-origin.
+ * Browsers do a CORS preflight (OPTIONS) for JSON POST requests.
+ * Without Access-Control-Allow-Origin on the OPTIONS + POST response, the browser blocks it.
+ */
+
+// Comma-separated list of exact origins you want to allow.
+// Example value:
+// https://www.neonframestudio.com,https://neonframestudio.com,https://admin.shopify.com
+const EXTRA_ALLOWED_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // non-browser clients / Quick Look / curl
+
+  // Always allow your main storefronts
+  const hardAllow = new Set([
+    "https://www.neonframestudio.com",
+    "https://neonframestudio.com",
+    ...EXTRA_ALLOWED_ORIGINS,
+  ]);
+
+  if (hardAllow.has(origin)) return true;
+
+  // Allow Shopify preview domains (theme preview / checkout surfaces often come from these)
+  // Examples:
+  // https://xxxx.myshopify.com
+  // https://xxxx.shopify.com (rare, but keep flexible)
+  if (/^https:\/\/[a-z0-9-]+\.myshopify\.com$/i.test(origin)) return true;
+  if (/^https:\/\/[a-z0-9-]+\.shopify\.com$/i.test(origin)) return true;
+
+  // Local dev
+  if (/^http:\/\/localhost(:\d+)?$/i.test(origin)) return true;
+  if (/^http:\/\/127\.0\.0\.1(:\d+)?$/i.test(origin)) return true;
+
+  return false;
+}
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (isAllowedOrigin(origin)) {
+    // Echo the requesting origin (safer than "*")
+    if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With"
+    );
+
+    // If you ever use cookies/credentials, you MUST set this and cannot use "*"
+    // res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+
+  // Handle preflight immediately
+  if (req.method === "OPTIONS") {
+    // Some browsers want a 204, some accept 200—204 is standard.
+    return res.status(204).end();
+  }
+
+  next();
+});
+
+/* --------------------------------------------------
    UTILS
 -------------------------------------------------- */
 
 function safeId() {
   return crypto.randomBytes(16).toString("hex");
-}
-
-function rmrf(p) {
-  try {
-    fs.rmSync(p, { recursive: true, force: true });
-  } catch {}
 }
 
 function fileSize(p) {
@@ -203,7 +269,7 @@ async function buildUsdzWithZip(outUsdzPath, jobDir, files) {
 }
 
 /* --------------------------------------------------
-   BUILD USDZ (PHASE 1 – STUBBED, AR WORKS)
+   BUILD USDZ
 -------------------------------------------------- */
 
 app.post("/build-usdz", async (req, res) => {
@@ -238,7 +304,6 @@ app.post("/build-usdz", async (req, res) => {
     fs.writeFileSync(texPath, imgBuf);
 
     // 2) Run Blender (make_usd.py) to generate model.usd referencing texture.png
-    // Note: Your Docker image MUST include blender + the script at /app/make_usd.py
     const blender = await runCmd(
       "sh",
       [
@@ -260,9 +325,10 @@ app.post("/build-usdz", async (req, res) => {
     // Ensure USDC if possible
     const usdcCheck = await ensureUsdc(usdPath);
 
-    // 2) Fix USD metadata + build USDZ (prefer usdzip; fallback zip)
+    // Fix USD metadata (best-effort)
     const usdFix = await fixUsdForQuickLook(usdPath);
 
+    // Build USDZ (prefer usdzip; fallback zip)
     let usdzBuild = { ok: false, method: null, out: "", err: "" };
 
     // Always remove any previous file
@@ -277,7 +343,6 @@ app.post("/build-usdz", async (req, res) => {
         ...(await buildUsdzWithUsdzip(usdzPath, usdPath, [texPath])),
       };
     } else {
-      // Fallback zip (can still fail Quick Look if alignment is required)
       usdzBuild.method = "zip";
       usdzBuild = {
         ...usdzBuild,
@@ -349,6 +414,7 @@ app.get("/usdz/:jobId/:file", (req, res) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "public, max-age=300");
     res.setHeader("Content-Disposition", `inline; filename="${file}"`);
+    res.setHeader("Accept-Ranges", "bytes");
 
     return res.sendFile(p);
   } catch {
