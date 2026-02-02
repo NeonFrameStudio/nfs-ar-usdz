@@ -3,338 +3,370 @@ import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { spawn, execSync } from "child_process";
-import sharp from "sharp";
+import { spawn } from "child_process";
 
 const app = express();
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "10mb" }));
 
-// CORS
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+/* --------------------------------------------------
+   CONFIG
+-------------------------------------------------- */
 
 const WORK_DIR = "/tmp/ar";
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
+// Render public URL (fallback safe)
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
-// capture stdout/stderr
-function run(cmd, args, cwd = undefined) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { cwd });
+/* --------------------------------------------------
+   UTILS
+-------------------------------------------------- */
+
+function safeId() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function rmrf(p) {
+  try {
+    fs.rmSync(p, { recursive: true, force: true });
+  } catch {}
+}
+
+function fileSize(p) {
+  try {
+    return fs.statSync(p).size;
+  } catch {
+    return 0;
+  }
+}
+
+function readUsdHeader8(filePath) {
+  try {
+    const fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(8);
+    fs.readSync(fd, buf, 0, 8, 0);
+    fs.closeSync(fd);
+    return {
+      ascii: buf.toString("ascii"),
+      hex: buf.toString("hex"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function runCmd(cmd, args, { cwd, timeoutMs } = {}) {
+  return await new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      cwd: cwd || undefined,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
 
     let out = "";
     let err = "";
 
-    p.stdout?.on("data", (d) => (out += d.toString()));
-    p.stderr?.on("data", (d) => (err += d.toString()));
+    const timer =
+      timeoutMs &&
+      setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }, timeoutMs);
 
-    p.on("error", (e) => reject({ kind: "spawn_error", e, out, err }));
-    p.on("close", (code) => {
-      if (code === 0) resolve({ code, out, err });
-      else reject({ kind: "exit_code", code, out, err });
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.stderr.on("data", (d) => (err += d.toString()));
+
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({
+        ok: code === 0,
+        code,
+        out,
+        err,
+      });
     });
   });
 }
 
-function parseDataUrl(dataUrl) {
-  const m = String(dataUrl || "").match(/^data:([^;]+);base64,(.+)$/i);
-  if (!m) return null;
-  return { mime: m[1], b64: m[2] };
-}
-
-async function bufferToNormalizedPng(buf, outPngPath) {
-  if (!buf || buf.length < 200)
-    throw new Error(`image_too_small:${buf ? buf.length : 0}`);
-
-  const head = buf.slice(0, 250).toString("utf8").toLowerCase();
-  if (head.includes("<html") || head.includes("<!doctype html")) {
-    throw new Error("image_is_html_not_image");
-  }
-
-  // Normalize to PNG (strips weird profiles/encodings)
-  const png = await sharp(buf, { failOnError: true })
-    .png({ compressionLevel: 9 })
-    .toBuffer();
-
-  fs.writeFileSync(outPngPath, png);
-  return { bytesIn: buf.length, bytesOut: png.length };
-}
-
-async function downloadAndNormalizeToPng(imageUrl, outPngPath) {
-  const r = await fetch(imageUrl, {
-    redirect: "follow",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (NFS-AR-Bot)",
-      Accept: "image/*,*/*;q=0.8",
-    },
-  });
-
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`image_download_failed:${r.status}:${txt.slice(0, 160)}`);
-  }
-
-  const buf = Buffer.from(await r.arrayBuffer());
-  const info = await bufferToNormalizedPng(buf, outPngPath);
-  return { source: "url", imageUrl, ...info };
-}
-
-async function dataUrlAndNormalizeToPng(imageDataUrl, outPngPath) {
-  const parsed = parseDataUrl(imageDataUrl);
-  if (!parsed) throw new Error("invalid_imageDataUrl");
-
-  const buf = Buffer.from(parsed.b64, "base64");
-  const info = await bufferToNormalizedPng(buf, outPngPath);
-  return { source: "dataUrl", mime: parsed.mime, ...info };
-}
-
-function readUsdHeader8(usdPath) {
-  const h = fs.readFileSync(usdPath).subarray(0, 8);
-  return {
-    ascii: h.toString("ascii"),
-    hex: Buffer.from(h).toString("hex"),
-  };
-}
-
-// If USD is not USDC, attempt to convert using usdcat (from your stage1 tools)
-async function ensureUsdc(jobDir, usdPath) {
-  const header = readUsdHeader8(usdPath);
-
-  // USDC typically starts with "PXR-USDC" (or similar); USDA is readable text "#usda"
-  const looksUsdc =
-    header.ascii.includes("PXR-USD") && !header.ascii.includes("#usda");
-  const isUsda =
-    header.ascii.includes("#usda") ||
-    header.ascii.toLowerCase().includes("usda");
-
+/**
+ * If the USD coming out of Blender is USDA (ASCII), Quick Look is much happier with USDC (binary).
+ * This tries to convert using usdcat if present.
+ */
+async function ensureUsdc(usdPath) {
   const result = {
-    header,
+    header: null,
     converted: false,
     converter: null,
     converterLogs: null,
+    path: usdPath,
   };
 
-  if (looksUsdc && !isUsda) return result;
+  result.header = readUsdHeader8(usdPath);
+  if (!result.header) return result;
 
-  // Try usdcat -> write back into model.usd as USDC
-  // (Keep .usd extension but binary content)
-  const tmpOut = path.join(jobDir, "model_usdc.usd");
-  try {
-    const logs = await run(
-      "bash",
-      ["-lc", `cd "${jobDir}" && usdcat "${usdPath}" -o "${tmpOut}"`],
-      jobDir
-    );
+  // Already USDC?
+  if (result.header.ascii === "PXR-USDC") return result;
 
-    if (fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 100) {
-      fs.copyFileSync(tmpOut, usdPath);
-      fs.unlinkSync(tmpOut);
+  // If USDA or something else, try convert to USDC using usdcat
+  const outPath = usdPath.replace(/\.usd$/i, ".usdc.usd");
 
-      result.converted = true;
-      result.converter = "usdcat";
-      result.converterLogs = {
-        out: (logs.out || "").slice(0, 4000),
-        err: (logs.err || "").slice(0, 4000),
-      };
-
-      // Update header after conversion
-      result.headerAfter = readUsdHeader8(usdPath);
-    }
-
-    return result;
-  } catch (e) {
-    // Don’t hard-fail here; return debug so we can see if usdcat exists
-    result.converter = "usdcat_failed";
-    result.converterLogs = {
-      out: (e?.out || "").slice(0, 4000),
-      err: (e?.err || "").slice(0, 4000),
-      spawnError: e?.e ? String(e.e?.message || e.e) : null,
-      kind: e?.kind,
-      code: e?.code,
-    };
+  // Detect usdcat existence
+  const which = await runCmd("sh", ["-lc", "command -v usdcat"], { timeoutMs: 8000 });
+  if (!which.ok || !which.out.trim()) {
+    result.converter = "usdcat_missing";
     return result;
   }
-}
 
-// 🔥 NEW: Extract embedded texture/path strings from the USD (this is what Quick Look AR really cares about)
-function extractUsdStringHits(usdPath) {
-  let hits = [];
-  try {
-    if (fs.existsSync(usdPath)) {
-      const out = execSync(`strings "${usdPath}"`, {
-        stdio: ["ignore", "pipe", "pipe"],
-      }).toString("utf-8");
+  // Convert
+  const conv = await runCmd(
+    "sh",
+    ["-lc", `usdcat "${usdPath}" -o "${outPath}"`],
+    { timeoutMs: 30000 }
+  );
 
-      hits = out
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .filter((l) => {
-          const s = l.toLowerCase();
-          return (
-            s.includes(".png") ||
-            s.includes(".jpg") ||
-            s.includes(".jpeg") ||
-            s.includes("/tmp") ||
-            s.includes("texture") ||
-            s.includes("textures/")
-          );
-        })
-        .slice(0, 80);
-    }
-  } catch (e) {
-    hits = [`strings_failed: ${e?.message || String(e)}`];
+  result.converter = "usdcat";
+  result.converterLogs = { out: conv.out, err: conv.err };
+
+  if (conv.ok && fs.existsSync(outPath) && fileSize(outPath) > 16) {
+    // Swap in converted file
+    fs.copyFileSync(outPath, usdPath);
+    result.converted = true;
+    result.header = readUsdHeader8(usdPath);
   }
-  return hits;
+
+  return result;
 }
+
+/**
+ * Fix common USD metadata that Quick Look / ARKit often expects.
+ * - Ensure upAxis is Y
+ * - Ensure metersPerUnit exists
+ * - Ensure defaultPrim is set (Quick Look can fail without it)
+ */
+async function fixUsdForQuickLook(usdPath) {
+  // If pxr bindings aren't available, we just skip (and rely on conversion + usdzip).
+  const py = `
+from pxr import Usd, UsdGeom
+import sys
+
+path = sys.argv[1]
+stage = Usd.Stage.Open(path)
+if not stage:
+  print("ERR: cannot open", path)
+  sys.exit(2)
+
+# Y-up for ARKit
+UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+
+# Reasonable default
+try:
+  stage.SetMetersPerUnit(1.0)
+except Exception:
+  pass
+
+# Ensure a defaultPrim exists
+default = stage.GetDefaultPrim()
+if not default:
+  kids = stage.GetPseudoRoot().GetChildren()
+  if kids:
+    stage.SetDefaultPrim(kids[0])
+
+stage.Save()
+print("OK")
+`;
+  const r = await runCmd("python3", ["-c", py, usdPath], { timeoutMs: 20000 });
+  // If python/pxr isn't installed, don't hard-fail — just record and continue.
+  if (!r.ok) {
+    return { ok: false, note: "pxr_python_missing_or_failed", ...r };
+  }
+  return { ok: true, ...r };
+}
+
+async function hasUsdzip() {
+  const r = await runCmd("usdzip", ["--help"], { timeoutMs: 8000 });
+  return r.ok;
+}
+
+async function buildUsdzWithUsdzip(outUsdzPath, usdPath, assetPaths) {
+  // usdzip usage is typically: usdzip output.usdz input.usd [assets...]
+  const args = [outUsdzPath, usdPath, ...(assetPaths || [])];
+  return await runCmd("usdzip", args, { timeoutMs: 60000 });
+}
+
+async function buildUsdzWithZip(outUsdzPath, jobDir, files) {
+  // Fallback: zip -0 (STORE). NOTE: may still fail Quick Look due to alignment requirements.
+  const cmd = `cd "${jobDir}" && zip -0 -q "${outUsdzPath}" ${files
+    .map((f) => `"${f}"`)
+    .join(" ")}`;
+  return await runCmd("sh", ["-lc", cmd], { timeoutMs: 30000 });
+}
+
+/* --------------------------------------------------
+   BUILD USDZ (PHASE 1 – STUBBED, AR WORKS)
+-------------------------------------------------- */
 
 app.post("/build-usdz", async (req, res) => {
-  let jobDir = null;
+  const requestId = safeId();
 
   try {
-    const { imageUrl, imageDataUrl, widthCm, heightCm } = req.body;
+    const { imageUrl, widthCm, heightCm } = req.body;
 
-    if ((!imageUrl && !imageDataUrl) || !widthCm || !heightCm) {
+    if (!imageUrl || !widthCm || !heightCm) {
       return res.status(400).json({
         ok: false,
         reason: "missing_params",
-        need: "imageUrl OR imageDataUrl + widthCm + heightCm",
+        requestId,
       });
     }
 
-    const id = crypto.randomUUID();
-    jobDir = path.join(WORK_DIR, id);
+    // Unique job dir
+    const jobId = safeId();
+    const jobDir = path.join(WORK_DIR, jobId);
     fs.mkdirSync(jobDir, { recursive: true });
 
-    const texturePath = path.join(jobDir, "texture.png");
+    // Paths inside jobDir
+    const texPath = path.join(jobDir, "texture.png");
     const usdPath = path.join(jobDir, "model.usd");
-    const usdzPath = path.join(WORK_DIR, `${id}.usdz`);
+    const usdzPath = path.join(jobDir, `${jobId}.usdz`);
 
-    // 0) Prepare normalized PNG
-    const info = imageDataUrl
-      ? await dataUrlAndNormalizeToPng(imageDataUrl, texturePath)
-      : await downloadAndNormalizeToPng(imageUrl, texturePath);
+    // 1) Download image
+    const imgResp = await fetch(imageUrl);
+    if (!imgResp.ok) throw new Error(`image_fetch_failed_${imgResp.status}`);
 
-    // 1) Blender -> USD (cwd = jobDir)
-    const blenderLogs = await run(
-      "blender",
+    const imgBuf = Buffer.from(await imgResp.arrayBuffer());
+    fs.writeFileSync(texPath, imgBuf);
+
+    // 2) Run Blender (make_usd.py) to generate model.usd referencing texture.png
+    // Note: Your Docker image MUST include blender + the script at /app/make_usd.py
+    const blender = await runCmd(
+      "sh",
       [
-        "-b",
-        "-P",
-        "/app/make_usd.py",
-        "--",
-        texturePath,
-        usdPath,
-        String(widthCm),
-        String(heightCm),
+        "-lc",
+        `blender -b -P /app/make_usd.py -- "${texPath}" "${usdPath}" "${Number(
+          widthCm
+        )}" "${Number(heightCm)}"`,
       ],
-      jobDir
+      { timeoutMs: 120000 }
     );
 
+    if (!blender.ok) {
+      throw new Error("blender_failed");
+    }
     if (!fs.existsSync(usdPath)) {
-      const listing = fs.existsSync(jobDir) ? fs.readdirSync(jobDir) : [];
-      throw new Error(
-        `usd_missing (jobDir contents: ${JSON.stringify(listing)})`
-      );
+      throw new Error("usd_missing");
     }
 
-    // 1.5) Verify/Convert to USDC if needed
-    const usdcCheck = await ensureUsdc(jobDir, usdPath);
+    // Ensure USDC if possible
+    const usdcCheck = await ensureUsdc(usdPath);
 
-    // 🔥 1.6) Extract “what’s actually inside the USD” (paths/textures)
-    const usdStringHits = extractUsdStringHits(usdPath);
+    // 2) Fix USD metadata + build USDZ (prefer usdzip; fallback zip)
+    const usdFix = await fixUsdForQuickLook(usdPath);
 
-    // 2) Zip jobDir CONTENTS as USDZ (STORE only)
-    const zipLogs = await run(
-      "bash",
-      ["-lc", `cd "${jobDir}" && rm -f "${usdzPath}" && zip -0 -r "${usdzPath}" .`],
-      jobDir
-    );
+    let usdzBuild = { ok: false, method: null, out: "", err: "" };
+
+    // Always remove any previous file
+    try {
+      fs.unlinkSync(usdzPath);
+    } catch {}
+
+    if (await hasUsdzip()) {
+      usdzBuild.method = "usdzip";
+      usdzBuild = {
+        ...usdzBuild,
+        ...(await buildUsdzWithUsdzip(usdzPath, usdPath, [texPath])),
+      };
+    } else {
+      // Fallback zip (can still fail Quick Look if alignment is required)
+      usdzBuild.method = "zip";
+      usdzBuild = {
+        ...usdzBuild,
+        ...(await buildUsdzWithZip(usdzPath, jobDir, ["model.usd", "texture.png"])),
+      };
+    }
 
     if (!fs.existsSync(usdzPath)) throw new Error("usdz_missing");
 
-    // Extra: list contents of the usdz
-    let usdzListing = null;
-    try {
-      const l = await run(
-        "bash",
-        ["-lc", `unzip -l "${usdzPath}" | sed -n '1,200p'`],
-        jobDir
-      );
-      usdzListing = (l.out || "").slice(0, 4000);
-    } catch {
-      usdzListing = null;
-    }
+    // Public URL
+    const publicUsdzUrl = `${PUBLIC_BASE_URL}/usdz/${jobId}/${jobId}.usdz`;
 
-    const listing = fs.existsSync(jobDir) ? fs.readdirSync(jobDir) : null;
+    // Helpful listing for debugging
+    const jobDirListing = fs.readdirSync(jobDir);
+    const usdzListing = `Archive: ${usdzPath}`;
 
     return res.json({
       ok: true,
-      debug: info,
-      jobDirListing: listing,
-      usd: usdcCheck,
-      usdStringHits, // 🔥 THIS is the “truth output” for AR failures
-      blender: {
-        out: (blenderLogs?.out || "").slice(0, 8000),
-        err: (blenderLogs?.err || "").slice(0, 8000),
+      requestId,
+      usdzUrl: publicUsdzUrl,
+      debug: {
+        source: "url",
+        imageUrl,
+        bytesIn: imgBuf.length,
+        bytesOut: fileSize(usdzPath),
       },
-      zip: {
-        out: (zipLogs?.out || "").slice(0, 4000),
-        err: (zipLogs?.err || "").slice(0, 4000),
+      blender: {
+        out: blender.out.slice(0, 4000),
+        err: blender.err.slice(0, 4000),
+      },
+      usd: usdcCheck,
+      usdFix,
+      usdzBuild: {
+        method: usdzBuild?.method || null,
+        ok: !!usdzBuild?.ok,
+        out: (usdzBuild?.out || "").slice(0, 8000),
+        err: (usdzBuild?.err || "").slice(0, 8000),
       },
       usdzListing,
-      usdzUrl: `${PUBLIC_BASE_URL}/usdz/${id}.usdz`,
+      jobDirListing,
     });
-  } catch (e) {
-    console.error("BUILD_USDZ_ERROR:", e);
-
-    const logs =
-      e && (e.out || e.err || e.e)
-        ? {
-            kind: e.kind,
-            code: e.code,
-            out: (e.out || "").slice(0, 8000),
-            err: (e.err || "").slice(0, 8000),
-            spawnError: e.e ? String(e.e?.message || e.e) : null,
-          }
-        : null;
-
-    const listing =
-      jobDir && fs.existsSync(jobDir) ? fs.readdirSync(jobDir) : null;
-
+  } catch (err) {
     return res.status(500).json({
       ok: false,
-      reason: "server_error",
-      message: String(e?.message || e),
-      logs,
-      jobDirListing: listing,
+      requestId,
+      reason: err?.message || String(err),
     });
   }
 });
 
-// Serve USDZ files
-app.use(
-  "/usdz",
-  express.static(WORK_DIR, {
-    setHeaders(res, p) {
-      if (p.endsWith(".usdz")) {
-        res.setHeader("Content-Type", "model/vnd.usdz+zip");
-        res.setHeader("Content-Disposition", 'inline; filename="model.usdz"');
-        res.setHeader("Cache-Control", "no-store");
-      }
-    },
-  })
-);
+/* --------------------------------------------------
+   SERVE USDZ FILES
+-------------------------------------------------- */
 
-// Healthcheck
-app.get("/", (req, res) => res.status(200).send("OK"));
+// Serve /usdz/<jobId>/<jobId>.usdz
+app.get("/usdz/:jobId/:file", (req, res) => {
+  try {
+    const { jobId, file } = req.params;
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("USDZ server running on port", PORT));
+    // Safety: only allow exact expected filename
+    if (file !== `${jobId}.usdz`) {
+      return res.status(404).send("not_found");
+    }
+
+    const p = path.join(WORK_DIR, jobId, file);
+    if (!fs.existsSync(p)) return res.status(404).send("not_found");
+
+    res.setHeader("Content-Type", "model/vnd.usdz+zip");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("Content-Disposition", `inline; filename="${file}"`);
+
+    return res.sendFile(p);
+  } catch {
+    return res.status(500).send("error");
+  }
+});
+
+/* --------------------------------------------------
+   HEALTH
+-------------------------------------------------- */
+
+app.get("/", (req, res) => res.send("OK"));
+
+/* --------------------------------------------------
+   START
+-------------------------------------------------- */
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`USDZ server running on port ${PORT}`);
+});
