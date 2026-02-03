@@ -39,7 +39,7 @@ def enable_usd_addon():
 
 enable_usd_addon()
 
-# Ensure texture.png exists in job dir (server already writes it; we keep a safe copy)
+# Ensure texture.png exists in job dir (server already writes it; keep safe copy)
 try:
     if os.path.abspath(IMG) != os.path.abspath(tex_path):
         shutil.copyfile(IMG, tex_path)
@@ -51,14 +51,13 @@ except Exception as e:
     raise
 
 # ------------------------------------------------------------
-# Geometry: Plane + Solidify  (fixes tiny/grey cube + UV issues)
+# Geometry: Plane + Solidify
 # ------------------------------------------------------------
 bpy.ops.mesh.primitive_plane_add(size=2)
 obj = bpy.context.active_object
 obj.name = "NFS_Frame"
 
-# Plane is 2m x 2m when size=2 (edge length), so scale to W x H
-# Using /2 keeps behavior consistent across Blender versions
+# Plane is 2m x 2m (edge length) when size=2, so scale to W x H
 obj.scale = (W / 2.0, H / 2.0, 1.0)
 
 # Solidify to give thickness
@@ -79,65 +78,31 @@ try:
 except Exception as e:
     log("Normals fix skipped:", e)
 
-# Ensure there is a UV map (plane usually has it, but be explicit)
+# Ensure there is a UV map and it is named "st" (Quick Look safe)
 try:
     if not obj.data.uv_layers:
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
         bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Force active UV layer name to "st"
+    if obj.data.uv_layers:
+        obj.data.uv_layers.active = obj.data.uv_layers[0]
+        obj.data.uv_layers.active.name = "st"
+        # Optionally remove extra UV layers to avoid exporter picking another one
+        while len(obj.data.uv_layers) > 1:
+            obj.data.uv_layers.remove(obj.data.uv_layers[-1])
+
+        log("UV layer forced to:", obj.data.uv_layers.active.name)
 except Exception as e:
-    log("UV generation skipped:", e)
+    log("UV setup skipped:", e)
 
 # ------------------------------------------------------------
-# Material with texture (relative path "texture.png")
+# IMPORTANT: Do NOT author Blender materials/textures in USD.
+# Your server binds a clean UsdPreviewSurface -> texture.png.
+# Blender exporting materials can create paths Quick Look ignores.
 # ------------------------------------------------------------
-mat = bpy.data.materials.new("NFS_Mat")
-mat.use_nodes = True
-nodes = mat.node_tree.nodes
-links = mat.node_tree.links
-nodes.clear()
-
-tex_node = nodes.new("ShaderNodeTexImage")
-tex_node.location = (-500, 0)
-
-# Load texture.png
-img = bpy.data.images.load(tex_path)
-
-# Force USD to reference just "texture.png" (relative)
-img.filepath = "texture.png"
-img.filepath_raw = "texture.png"
-
-try:
-    img.colorspace_settings.name = "sRGB"
-except Exception:
-    pass
-
-tex_node.image = img
-
-uv_node = nodes.new("ShaderNodeTexCoord")
-uv_node.location = (-750, 0)
-links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
-
-bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-bsdf.location = (-150, 0)
-
-# Base color + slight emission for visibility
-links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
-if "Emission" in bsdf.inputs:
-    links.new(tex_node.outputs["Color"], bsdf.inputs["Emission"])
-if "Emission Strength" in bsdf.inputs:
-    bsdf.inputs["Emission Strength"].default_value = 0.6
-if "Roughness" in bsdf.inputs:
-    bsdf.inputs["Roughness"].default_value = 0.35
-if "Specular" in bsdf.inputs:
-    bsdf.inputs["Specular"].default_value = 0.2
-
-out = nodes.new("ShaderNodeOutputMaterial")
-out.location = (250, 0)
-links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-
-obj.data.materials.clear()
-obj.data.materials.append(mat)
+# (We deliberately do NOT create a material node tree here.)
 
 # ------------------------------------------------------------
 # Export USD (not USDZ)
@@ -145,13 +110,15 @@ obj.data.materials.append(mat)
 if not hasattr(bpy.ops.wm, "usd_export"):
     raise RuntimeError("bpy.ops.wm.usd_export missing (USD exporter not available)")
 
-# Use relative paths so texture is portable into USDZ
+# Export GEOMETRY ONLY — server will bind materials + texture.png
 bpy.ops.wm.usd_export(
     filepath=USD,
     selected_objects_only=True,
-    export_textures=True,
+
+    # Keep it simple + deterministic
+    export_materials=False,
+    export_textures=False,
     relative_paths=True,
-    export_materials=True,
 )
 
 # Validate output
@@ -162,6 +129,7 @@ if not os.path.exists(USD):
 log("USD created OK:", USD, "bytes:", os.path.getsize(USD))
 
 # Diagnostic: show any texture references embedded in the USD
+# (Should be none; server adds binding later)
 try:
     out = subprocess.check_output(["strings", USD], stderr=subprocess.STDOUT).decode("utf-8", "ignore")
     hits = []
@@ -169,6 +137,6 @@ try:
         low = line.lower()
         if "png" in low or "texture" in low or "/tmp/" in low or "textures/" in low:
             hits.append(line[:300])
-    log("USD strings hits:", hits[:50])
+    log("USD strings hits (expect empty):", hits[:50])
 except Exception as e:
     log("strings diagnostic skipped:", e)
