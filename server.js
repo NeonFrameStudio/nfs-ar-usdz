@@ -10,7 +10,7 @@ const app = express();
 /* --------------------------------------------------
    VERSION STAMP (so you can confirm correct deploy)
 -------------------------------------------------- */
-const SERVER_VERSION = "server.js vCORS-2026-02-03-safe-usdzip+blenderPXRfix";
+const SERVER_VERSION = "server.js vCORS-2026-02-03-safe-usdzip+blenderPXRfix+imageData+usdzipRel";
 
 /* --------------------------------------------------
    CONFIG
@@ -142,6 +142,37 @@ function readUsdHeader8(filePath) {
   } catch {
     return null;
   }
+}
+
+
+function sniffPng(buf) {
+  try {
+    if (!buf || buf.length < 8) return false;
+    // PNG signature: 89 50 4E 47 0D 0A 1A 0A
+    return (
+      buf[0] === 0x89 &&
+      buf[1] === 0x50 &&
+      buf[2] === 0x4e &&
+      buf[3] === 0x47 &&
+      buf[4] === 0x0d &&
+      buf[5] === 0x0a &&
+      buf[6] === 0x1a &&
+      buf[7] === 0x0a
+    );
+  } catch {
+    return false;
+  }
+}
+
+function parseDataUrlImage(dataUrl) {
+  // expects data:image/png;base64,....
+  if (!dataUrl || typeof dataUrl !== "string") return null;
+  const m = dataUrl.match(/^data:(image\/(png|jpeg|jpg|webp));base64,(.+)$/i);
+  if (!m) return null;
+  const mime = m[1].toLowerCase();
+  const b64 = m[3];
+  const buf = Buffer.from(b64, "base64");
+  return { mime, buf };
 }
 
 /**
@@ -413,9 +444,9 @@ async function hasUsdzip() {
 }
 
 async function buildUsdzWithUsdzip(outUsdzPath, jobDir) {
-  // Use relative names inside the container (Quick Look expects a clean archive)
-  const args = [outUsdzPath, "model.usd", "texture.png"];
-  return await runCmd("usdzip", args, { cwd: jobDir, timeoutMs: 60000 });
+  // Build from inside jobDir so assets land at USDZ root (Quick Look-friendly)
+  const cmd = `cd "${jobDir}" && usdzip "${outUsdzPath}" "model.usd" "texture.png"`;
+  return await runCmd("sh", ["-lc", cmd], { timeoutMs: 60000 });
 }
 
 async function buildUsdzWithZip(outUsdzPath, jobDir, files) {
@@ -453,11 +484,38 @@ app.post("/build-usdz", async (req, res) => {
     const usdPath = path.join(jobDir, "model.usd");
     const usdzPath = path.join(jobDir, `${jobId}.usdz`);
 
-    // 1) Download image
-    const imgResp = await fetch(imageUrl);
-    if (!imgResp.ok) throw new Error(`image_fetch_failed_${imgResp.status}`);
+    // 1) Get image (prefer imageData from client; fallback to imageUrl)
+    let imgBuf;
 
-    const imgBuf = Buffer.from(await imgResp.arrayBuffer());
+    if (req.body.imageData) {
+      const parsed = parseDataUrlImage(req.body.imageData);
+      if (!parsed) {
+        return res.status(400).json({
+          ok: false,
+          reason: "imageData_invalid",
+          requestId,
+        });
+      }
+      imgBuf = parsed.buf;
+    } else {
+      const imgResp = await fetch(imageUrl);
+      if (!imgResp.ok) throw new Error(`image_fetch_failed_${imgResp.status}`);
+      imgBuf = Buffer.from(await imgResp.arrayBuffer());
+    }
+
+    // Hard validate PNG so we never generate grey slabs from HTML/404 pages
+    if (!sniffPng(imgBuf)) {
+      return res.status(400).json({
+        ok: false,
+        reason: "image_not_png",
+        requestId,
+        debug: {
+          serverVersion: SERVER_VERSION,
+          firstBytesHex: Buffer.from(imgBuf.slice(0, 32)).toString("hex"),
+        },
+      });
+    }
+
     fs.writeFileSync(texPath, imgBuf);
 
     // 2) Run Blender (make_usd.py)
