@@ -407,28 +407,43 @@ if meshPrim and default:
   matPath = default.GetPath().AppendChild("NFS_Material")
   mat = UsdShade.Material.Define(stage, matPath)
 
+  # Preview surface shader
   pbrPath = matPath.AppendChild("PreviewSurface")
   pbr = UsdShade.Shader.Define(stage, pbrPath)
   pbr.CreateIdAttr("UsdPreviewSurface")
 
+  # IMPORTANT: Create outputs explicitly
+  pbrOut = pbr.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+
+  # UV Texture shader
   texPath = matPath.AppendChild("Texture")
   tex = UsdShade.Shader.Define(stage, texPath)
   tex.CreateIdAttr("UsdUVTexture")
   tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath("texture.png"))
   tex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
-  tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
 
+  texRgb = tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+  # Primvar reader for UVs
   stPath = matPath.AppendChild("PrimvarST")
   st = UsdShade.Shader.Define(stage, stPath)
   st.CreateIdAttr("UsdPrimvarReader_float2")
   st.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
-  st.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+  stOut = st.CreateOutput("result", Sdf.ValueTypeNames.Float2)
 
-  tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st, "result")
-  pbr.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(tex, "rgb")
+  # Connect UVs into texture
+  tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(stOut)
 
-  mat.CreateSurfaceOutput().ConnectToSource(pbr, "surface")
+  # Connect texture into diffuse
+  pbr.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(texRgb)
+
+  # Connect material surface -> shader output
+  matSurf = mat.CreateSurfaceOutput()
+  matSurf.ConnectToSource(pbrOut)
+
+  # Bind material to mesh
   UsdShade.MaterialBindingAPI(meshPrim).Bind(mat)
+
 
 # ---- AUTO SCALE FIX (if it came out tiny) ----
 try:
