@@ -11,7 +11,7 @@ IMG, USD, W, H = argv
 W = float(W) / 100.0
 H = float(H) / 100.0
 
-DEPTH = 0.015  # 1.5cm thickness (AR-safe)
+DEPTH = 0.015  # 1.5cm thickness
 
 log("IMG:", IMG)
 log("USD:", USD)
@@ -32,15 +32,14 @@ def enable_usd_addon():
             if state[0] is not None:
                 bpy.ops.preferences.addon_enable(module=mod)
                 log("Enabled addon:", mod)
-                return mod
-        except Exception as e:
-            log("Addon check error:", mod, e)
-    log("No USD addon explicitly enabled (may be built-in).")
-    return None
+                return True
+        except Exception:
+            pass
+    return False
 
 enable_usd_addon()
 
-# Ensure we have texture.png in the same directory as the USD output
+# Ensure texture.png exists in job dir (server already writes it; we keep a safe copy)
 try:
     if os.path.abspath(IMG) != os.path.abspath(tex_path):
         shutil.copyfile(IMG, tex_path)
@@ -51,18 +50,28 @@ except Exception as e:
     log("FAILED copying IMG -> texture.png:", e)
     raise
 
-# Create a thin box (NOT a plane)
-bpy.ops.mesh.primitive_cube_add(size=1)
+# ------------------------------------------------------------
+# Geometry: Plane + Solidify  (fixes tiny/grey cube + UV issues)
+# ------------------------------------------------------------
+bpy.ops.mesh.primitive_plane_add(size=2)
 obj = bpy.context.active_object
 obj.name = "NFS_Frame"
 
-# Scale cube to match requested size
-obj.scale = (W / 2.0, H / 2.0, DEPTH / 2.0)
+# Plane is 2m x 2m when size=2 (edge length), so scale to W x H
+# Using /2 keeps behavior consistent across Blender versions
+obj.scale = (W / 2.0, H / 2.0, 1.0)
 
-# Apply transforms so exported mesh has real dimensions baked in
+# Solidify to give thickness
+solid = obj.modifiers.new(name="NFS_Solidify", type="SOLIDIFY")
+solid.thickness = DEPTH
+solid.offset = 0.0  # center thickness around plane
+solid.use_rim = True
+
+# Apply transforms + modifier so exported mesh is baked
 bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+bpy.ops.object.modifier_apply(modifier=solid.name)
 
-# Ensure normals are correct (helps AR)
+# Ensure normals are correct
 try:
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.normals_make_consistent(inside=False)
@@ -70,7 +79,18 @@ try:
 except Exception as e:
     log("Normals fix skipped:", e)
 
-# Material with texture
+# Ensure there is a UV map (plane usually has it, but be explicit)
+try:
+    if not obj.data.uv_layers:
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+        bpy.ops.object.mode_set(mode='OBJECT')
+except Exception as e:
+    log("UV generation skipped:", e)
+
+# ------------------------------------------------------------
+# Material with texture (relative path "texture.png")
+# ------------------------------------------------------------
 mat = bpy.data.materials.new("NFS_Mat")
 mat.use_nodes = True
 nodes = mat.node_tree.nodes
@@ -80,10 +100,10 @@ nodes.clear()
 tex_node = nodes.new("ShaderNodeTexImage")
 tex_node.location = (-500, 0)
 
-# IMPORTANT: Load *texture.png from job dir*
+# Load texture.png
 img = bpy.data.images.load(tex_path)
 
-# CRITICAL: Force USD to reference just "texture.png" (relative)
+# Force USD to reference just "texture.png" (relative)
 img.filepath = "texture.png"
 img.filepath_raw = "texture.png"
 
@@ -94,7 +114,6 @@ except Exception:
 
 tex_node.image = img
 
-# Use UVs explicitly (sometimes helps exporter consistency)
 uv_node = nodes.new("ShaderNodeTexCoord")
 uv_node.location = (-750, 0)
 links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
@@ -102,15 +121,16 @@ links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
 bsdf = nodes.new("ShaderNodeBsdfPrincipled")
 bsdf.location = (-150, 0)
 
-# Make it visible in AR
+# Base color + slight emission for visibility
+links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
 if "Emission" in bsdf.inputs:
     links.new(tex_node.outputs["Color"], bsdf.inputs["Emission"])
 if "Emission Strength" in bsdf.inputs:
-    bsdf.inputs["Emission Strength"].default_value = 1.0
+    bsdf.inputs["Emission Strength"].default_value = 0.6
 if "Roughness" in bsdf.inputs:
     bsdf.inputs["Roughness"].default_value = 0.35
-
-links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+if "Specular" in bsdf.inputs:
+    bsdf.inputs["Specular"].default_value = 0.2
 
 out = nodes.new("ShaderNodeOutputMaterial")
 out.location = (250, 0)
@@ -119,42 +139,20 @@ links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 obj.data.materials.clear()
 obj.data.materials.append(mat)
 
-# Export USD
+# ------------------------------------------------------------
+# Export USD (not USDZ)
+# ------------------------------------------------------------
 if not hasattr(bpy.ops.wm, "usd_export"):
-    raise RuntimeError("bpy.ops.wm.usd_export not available in this Blender build")
+    raise RuntimeError("bpy.ops.wm.usd_export missing (USD exporter not available)")
 
-# Only pass supported args (Blender varies by version)
-props = set()
-try:
-    props = set(bpy.ops.wm.usd_export.get_rna_type().properties.keys())
-except Exception:
-    pass
-
-kwargs = {
-    "filepath": USD,
-    "export_materials": True,
-}
-
-# Prefer exporter writing relative refs if supported
-if "relative_paths" in props:
-    kwargs["relative_paths"] = True
-
-# We package texture.png ourselves — do not let Blender relocate unless you want it
-if "export_textures" in props:
-    kwargs["export_textures"] = False
-
-# Force USDC if supported
-if "export_format" in props:
-    kwargs["export_format"] = "USDC"
-
-# Some Blender builds have these:
-if "export_uvmaps" in props:
-    kwargs["export_uvmaps"] = True
-if "export_normals" in props:
-    kwargs["export_normals"] = True
-
-log("usd_export kwargs:", kwargs)
-bpy.ops.wm.usd_export(**kwargs)
+# Use relative paths so texture is portable into USDZ
+bpy.ops.wm.usd_export(
+    filepath=USD,
+    selected_objects_only=True,
+    export_textures=True,
+    relative_paths=True,
+    export_materials=True,
+)
 
 # Validate output
 if not os.path.exists(USD):
@@ -163,7 +161,7 @@ if not os.path.exists(USD):
 
 log("USD created OK:", USD, "bytes:", os.path.getsize(USD))
 
-# EXTRA DIAGNOSTIC: show any texture references embedded in the USD
+# Diagnostic: show any texture references embedded in the USD
 try:
     out = subprocess.check_output(["strings", USD], stderr=subprocess.STDOUT).decode("utf-8", "ignore")
     hits = []
