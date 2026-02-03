@@ -465,13 +465,19 @@ app.post("/build-usdz", async (req, res) => {
   const requestId = safeId();
 
   try {
-    const { imageUrl, widthCm, heightCm } = req.body;
+    const { imageUrl, imageData, widthCm, heightCm } = req.body || {};
 
-    if (!imageUrl || !widthCm || !heightCm) {
+    const hasImageData =
+      typeof imageData === "string" && /^data:image\/[a-zA-Z0-9.+-]+;base64,/.test(imageData);
+    const hasImageUrl = typeof imageUrl === "string" && imageUrl.trim().length > 0;
+
+    if ((!hasImageData && !hasImageUrl) || !widthCm || !heightCm) {
       return res.status(400).json({
         ok: false,
         reason: "missing_params",
         requestId,
+        need: { imageUrl_or_imageData: true, widthCm: true, heightCm: true },
+        got: { hasImageUrl, hasImageData, widthCm, heightCm },
       });
     }
 
