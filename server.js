@@ -583,6 +583,10 @@ app.post("/build-usdz", async (req, res) => {
 
     // ✅ IMPORTANT: Run Quick Look fix through Blender's python (pxr available there)
     const usdFix = await fixUsdForQuickLook(usdPath, jobDir);
+     if (usdFix && (String(usdFix.err || "").includes("Traceback") || String(usdFix.out || "").includes("ERR:"))) {
+  throw new Error("usd_fix_script_failed");
+}
+
 
     // Build USDZ: prefer usdzip if installed, else zip -0
     let usdzBuild = { ok: false, method: null, out: "", err: "" };
