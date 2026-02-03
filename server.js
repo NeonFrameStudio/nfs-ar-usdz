@@ -459,7 +459,7 @@ try:
 except Exception as e:
   print("scale_fix_skipped", e)
 
-stage.Save()
+stage.GetRootLayer().Save()
 print("OK fixed", usdPath)
 `;
 
