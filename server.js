@@ -10,7 +10,8 @@ const app = express();
 /* --------------------------------------------------
    VERSION STAMP (so you can confirm correct deploy)
 -------------------------------------------------- */
-const SERVER_VERSION = "server.js vCORS-2026-02-03-safe-usdzip+blenderPXRfix+imageData+usdzipRel";
+const SERVER_VERSION = "server.js v2026-02-03-usdzip-only-no-zip-fallback";
+
 
 /* --------------------------------------------------
    CONFIG
@@ -576,16 +577,17 @@ app.post("/build-usdz", async (req, res) => {
     } catch {}
 
     const canUsdzip = await hasUsdzip();
-    if (canUsdzip) {
-      usdzBuild.method = "usdzip";
-      usdzBuild = { ...usdzBuild, ...(await buildUsdzWithUsdzip(usdzPath, jobDir)) };
-    } else {
-      usdzBuild.method = "zip";
-      usdzBuild = {
-        ...usdzBuild,
-        ...(await buildUsdzWithZip(usdzPath, jobDir, ["model.usd", "texture.png"])),
-      };
-    }
+if (!canUsdzip) {
+  throw new Error("usdzip_missing_on_server");
+}
+
+usdzBuild.method = "usdzip";
+usdzBuild = { ...usdzBuild, ...(await buildUsdzWithUsdzip(usdzPath, jobDir)) };
+
+if (!usdzBuild.ok) {
+  throw new Error(`usdzip_failed: ${(usdzBuild.err || usdzBuild.out || "").slice(0, 300)}`);
+}
+
 
     if (!fs.existsSync(usdzPath) || fileSize(usdzPath) < 32) {
       throw new Error(`usdz_missing_or_empty (${usdzBuild.method})`);
