@@ -372,6 +372,34 @@ if default:
       meshPrim = p
       break
 
+
+# ---- ENSURE UV primvar named "st" (Blender sometimes exports st0) ----
+try:
+  if meshPrim:
+    pv = UsdGeom.PrimvarsAPI(meshPrim)
+    stpv = pv.GetPrimvar("st")
+    if (not stpv) or (not stpv.IsDefined()):
+      candidate = None
+      preferred = ("st0","st1","uv","uv0","texcoord","texcoords","map1")
+      for pr in pv.GetPrimvars():
+        try:
+          n = pr.GetName()
+          tn = pr.GetTypeName()
+          is_tex = (tn == Sdf.ValueTypeNames.TexCoord2fArray) or (tn == Sdf.ValueTypeNames.Float2Array)
+          if is_tex and n != "st":
+            candidate = pr
+            if n.lower() in preferred:
+              break
+        except Exception:
+          pass
+      if candidate and candidate.IsDefined():
+        vals = candidate.Get()
+        interp = candidate.GetInterpolation()
+        newst = pv.CreatePrimvar("st", candidate.GetTypeName(), interp)
+        newst.Set(vals)
+except Exception as e:
+  print("uv_fix_skipped", e)
+
 # ---- FORCE UsdPreviewSurface material bound to mesh ----
 # Quick Look is picky; this guarantees texture displays.
 if meshPrim and default:
