@@ -10,8 +10,7 @@ const app = express();
 /* --------------------------------------------------
    VERSION STAMP (so you can confirm correct deploy)
 -------------------------------------------------- */
-const SERVER_VERSION = "server.js v2026-02-03-usdzip-only-no-zip-fallback";
-
+const SERVER_VERSION = "server.js v2026-02-03-zip-fallback-enabled+pxrfix+imageData";
 
 /* --------------------------------------------------
    CONFIG
@@ -20,7 +19,7 @@ const SERVER_VERSION = "server.js v2026-02-03-usdzip-only-no-zip-fallback";
 const WORK_DIR = "/tmp/ar";
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
-// Render public URL (fallback safe)
+// Public base URL (where THIS server is reachable)
 const PUBLIC_BASE_URL =
   process.env.PUBLIC_BASE_URL || "https://nfs-ar-usdz.onrender.com";
 
@@ -28,13 +27,11 @@ const PUBLIC_BASE_URL =
    CORS
 -------------------------------------------------- */
 
-// Extra allowlist via env (comma separated)
 const EXTRA_ALLOWED_ORIGINS = (process.env.CORS_ALLOW_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Hard allow (exact)
 const HARD_ALLOW = new Set([
   "https://www.neonframestudio.com",
   "https://neonframestudio.com",
@@ -42,18 +39,17 @@ const HARD_ALLOW = new Set([
 ]);
 
 function isAllowedOrigin(origin) {
-  // Allow server-to-server / curl (no Origin header)
-  if (!origin) return true;
+  if (!origin) return true; // server-to-server / curl
 
   if (HARD_ALLOW.has(origin)) return true;
 
-  // Allow any secure subdomain of neonframestudio.com
+  // any secure subdomain of neonframestudio.com
   if (/^https:\/\/([a-z0-9-]+\.)*neonframestudio\.com$/i.test(origin)) return true;
 
   // Shopify shop domain
   if (/^https:\/\/[a-z0-9-]+\.myshopify\.com$/i.test(origin)) return true;
 
-  // Shopify admin surfaces (sometimes)
+  // Shopify admin surfaces
   if (/^https:\/\/admin\.shopify\.com$/i.test(origin)) return true;
 
   // Local dev
@@ -100,7 +96,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Extra explicit OPTIONS handler (belt + braces)
+// Extra explicit OPTIONS handler
 app.options("/build-usdz", (req, res) => {
   try {
     applyCors(req, res);
@@ -111,7 +107,6 @@ app.options("/build-usdz", (req, res) => {
 /* --------------------------------------------------
    BODY PARSER
 -------------------------------------------------- */
-
 app.use(express.json({ limit: "10mb" }));
 
 /* --------------------------------------------------
@@ -144,7 +139,6 @@ function readUsdHeader8(filePath) {
     return null;
   }
 }
-
 
 function sniffPng(buf) {
   try {
@@ -220,7 +214,6 @@ async function runCmd(cmd, args, { cwd, timeoutMs } = {}) {
     child.stdout?.on("data", (d) => (out += d.toString()));
     child.stderr?.on("data", (d) => (err += d.toString()));
 
-    // 🔥 ENOENT lands here
     child.on("error", (e) => {
       if (timer) clearTimeout(timer);
       done({
@@ -244,7 +237,7 @@ async function runCmd(cmd, args, { cwd, timeoutMs } = {}) {
 }
 
 /**
- * If the USD coming out of Blender is USDA (ASCII), Quick Look is often happier with USDC (binary).
+ * If USD is ASCII (usda), Quick Look is often happier with binary (usdc).
  * This tries to convert using usdcat if present.
  */
 async function ensureUsdc(usdPath) {
@@ -264,7 +257,6 @@ async function ensureUsdc(usdPath) {
 
   const outPath = usdPath.replace(/\.usd$/i, ".usdc.usd");
 
-  // Detect usdcat existence safely
   const which = await runCmd("sh", ["-lc", "command -v usdcat"], { timeoutMs: 8000 });
   if (!which.ok || !which.out.trim()) {
     result.converter = "usdcat_missing";
@@ -288,26 +280,13 @@ async function ensureUsdc(usdPath) {
 }
 
 /**
- * Fix common USD issues for Quick Look / ARKit.
- *
- * IMPORTANT: On Render/Docker, system python usually does NOT have pxr.
- * Blender DOES have pxr in its embedded python. So we run Blender -b -P script.
- *
- * Fixes:
- * - up axis = Y
- * - metersPerUnit = 1
- * - default prim set
- * - rewrite ANY texture asset path -> basename (texture.png)
- * - force bind a UsdPreviewSurface material that uses texture.png (Quick Look safe)
- * - optional auto-scale if object is tiny
+ * Fix common USD issues for Quick Look / ARKit by running pxr inside Blender python.
  */
 async function fixUsdForQuickLook(usdPath, jobDir) {
   const scriptPath = path.join(jobDir, "fix_quicklook.py");
 
   const script = `
 import sys, os
-
-# Blender passes args after '--'
 if "--" not in sys.argv:
   print("ERR: missing -- separator")
   raise SystemExit(2)
@@ -321,9 +300,7 @@ if not stage:
   print("ERR: cannot open", usdPath)
   raise SystemExit(2)
 
-# ---- Core Quick Look expectations ----
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
-
 try:
   stage.SetMetersPerUnit(1.0)
 except Exception:
@@ -336,7 +313,7 @@ if not default:
     stage.SetDefaultPrim(kids[0])
     default = stage.GetDefaultPrim()
 
-# ---- FIX TEXTURE PATHS: /tmp/.../texture.png -> texture.png ----
+# rewrite any texture asset paths -> basename
 for prim in stage.Traverse():
   for attr in prim.GetAttributes():
     tn = attr.GetTypeName()
@@ -365,7 +342,7 @@ for prim in stage.Traverse():
     except Exception:
       pass
 
-# ---- Find first Mesh under default prim ----
+# find first Mesh
 meshPrim = None
 if default:
   for p in Usd.PrimRange(default):
@@ -373,8 +350,7 @@ if default:
       meshPrim = p
       break
 
-
-# ---- ENSURE UV primvar named "st" (Blender sometimes exports st0) ----
+# ensure uv primvar is named st
 try:
   if meshPrim:
     pv = UsdGeom.PrimvarsAPI(meshPrim)
@@ -401,51 +377,37 @@ try:
 except Exception as e:
   print("uv_fix_skipped", e)
 
-# ---- FORCE UsdPreviewSurface material bound to mesh ----
-# Quick Look is picky; this guarantees texture displays.
+# force a UsdPreviewSurface material (Quick Look friendly)
 if meshPrim and default:
   matPath = default.GetPath().AppendChild("NFS_Material")
   mat = UsdShade.Material.Define(stage, matPath)
 
-  # Preview surface shader
   pbrPath = matPath.AppendChild("PreviewSurface")
   pbr = UsdShade.Shader.Define(stage, pbrPath)
   pbr.CreateIdAttr("UsdPreviewSurface")
-
-  # IMPORTANT: Create outputs explicitly
   pbrOut = pbr.CreateOutput("surface", Sdf.ValueTypeNames.Token)
 
-  # UV Texture shader
   texPath = matPath.AppendChild("Texture")
   tex = UsdShade.Shader.Define(stage, texPath)
   tex.CreateIdAttr("UsdUVTexture")
   tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath("texture.png"))
   tex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
-
   texRgb = tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
 
-  # Primvar reader for UVs
   stPath = matPath.AppendChild("PrimvarST")
   st = UsdShade.Shader.Define(stage, stPath)
   st.CreateIdAttr("UsdPrimvarReader_float2")
   st.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
   stOut = st.CreateOutput("result", Sdf.ValueTypeNames.Float2)
 
-  # Connect UVs into texture
   tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(stOut)
-
-  # Connect texture into diffuse
   pbr.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(texRgb)
 
-  # Connect material surface -> shader output
   matSurf = mat.CreateSurfaceOutput()
   matSurf.ConnectToSource(pbrOut)
-
-  # Bind material to mesh
   UsdShade.MaterialBindingAPI(meshPrim).Bind(mat)
 
-
-# ---- AUTO SCALE FIX (if it came out tiny) ----
+# autoscale if tiny
 try:
   if default:
     root = UsdGeom.Xformable(default)
@@ -466,29 +428,35 @@ print("OK fixed", usdPath)
   fs.writeFileSync(scriptPath, script, "utf8");
 
   const t0 = Date.now();
-  const r = await runCmd(
-    "blender",
-    ["-b", "-P", scriptPath, "--", usdPath],
-    { cwd: jobDir, timeoutMs: 120000 }
-  );
+  const r = await runCmd("blender", ["-b", "-P", scriptPath, "--", usdPath], {
+    cwd: jobDir,
+    timeoutMs: 120000,
+  });
 
   if (!r.ok) {
     return { ok: false, note: "blender_pxr_fix_failed", ms: Date.now() - t0, ...r };
   }
+
+  // If Blender printed ERR: or Traceback, treat as failure
+  const out = String(r.out || "");
+  const err = String(r.err || "");
+  if (out.includes("ERR:") || err.includes("Traceback") || out.includes("Traceback")) {
+    return { ok: false, note: "pxr_script_error", ms: Date.now() - t0, ...r };
+  }
+
   return { ok: true, ms: Date.now() - t0, ...r };
 }
 
-/**
- * SAFE usdzip detection:
- * do NOT execute usdzip; just check if it's installed.
- */
+/* --------------------------------------------------
+   USDZ BUILD HELPERS
+-------------------------------------------------- */
+
 async function hasUsdzip() {
   const r = await runCmd("sh", ["-lc", "command -v usdzip"], { timeoutMs: 8000 });
   return !!(r.ok && r.out && r.out.trim());
 }
 
 async function buildUsdzWithUsdzip(outUsdzPath, jobDir) {
-  // Build from inside jobDir so assets land at USDZ root (Quick Look-friendly)
   const cmd = `cd "${jobDir}" && usdzip "${outUsdzPath}" "model.usd" "texture.png"`;
   return await runCmd("sh", ["-lc", cmd], { timeoutMs: 60000 });
 }
@@ -502,7 +470,7 @@ async function buildUsdzWithZip(outUsdzPath, jobDir, files) {
 }
 
 /* --------------------------------------------------
-   BUILD USDZ
+   BUILD USDZ ENDPOINT
 -------------------------------------------------- */
 
 app.post("/build-usdz", async (req, res) => {
@@ -511,7 +479,6 @@ app.post("/build-usdz", async (req, res) => {
   try {
     const { imageUrl, imageData, widthCm, heightCm } = req.body;
 
-    // Need dimensions + either imageData (preferred) or imageUrl (fallback)
     if ((!imageData && !imageUrl) || !widthCm || !heightCm) {
       return res.status(400).json({
         ok: false,
@@ -529,11 +496,11 @@ app.post("/build-usdz", async (req, res) => {
     const usdPath = path.join(jobDir, "model.usd");
     const usdzPath = path.join(jobDir, `${jobId}.usdz`);
 
-    // 1) Get image (prefer imageData from client; fallback to imageUrl)
+    // 1) Get image (prefer imageData; fallback imageUrl)
     let imgBuf;
 
-    if (req.body.imageData) {
-      const parsed = parseDataUrlImage(req.body.imageData);
+    if (imageData) {
+      const parsed = parseDataUrlImage(imageData);
       if (!parsed) {
         return res.status(400).json({
           ok: false,
@@ -548,7 +515,7 @@ app.post("/build-usdz", async (req, res) => {
       imgBuf = Buffer.from(await imgResp.arrayBuffer());
     }
 
-    // Hard validate PNG so we never generate grey slabs from HTML/404 pages
+    // Validate PNG (prevents grey/purple slabs from HTML/404)
     if (!sniffPng(imgBuf)) {
       return res.status(400).json({
         ok: false,
@@ -563,7 +530,7 @@ app.post("/build-usdz", async (req, res) => {
 
     fs.writeFileSync(texPath, imgBuf);
 
-    // 2) Run Blender (make_usd.py)
+    // 2) Run Blender make_usd.py
     const blender = await runCmd(
       "sh",
       [
@@ -578,17 +545,16 @@ app.post("/build-usdz", async (req, res) => {
     if (!blender.ok) throw new Error(`blender_failed: ${blender.err || blender.out}`);
     if (!fs.existsSync(usdPath)) throw new Error("usd_missing");
 
-    // Best-effort USDC + metadata fixes
+    // 3) USDC conversion (best-effort)
     const usdcCheck = await ensureUsdc(usdPath);
 
-    // ✅ IMPORTANT: Run Quick Look fix through Blender's python (pxr available there)
+    // 4) Quick Look fix via Blender pxr
     const usdFix = await fixUsdForQuickLook(usdPath, jobDir);
-     if (usdFix && (String(usdFix.err || "").includes("Traceback") || String(usdFix.out || "").includes("ERR:"))) {
-  throw new Error("usd_fix_script_failed");
-}
+    if (!usdFix.ok) {
+      throw new Error(`usd_fix_failed: ${usdFix.note || "unknown"}`);
+    }
 
-
-    // Build USDZ: prefer usdzip if installed, else zip -0
+    // 5) Build USDZ: prefer usdzip else zip -0 fallback
     let usdzBuild = { ok: false, method: null, out: "", err: "" };
 
     try {
@@ -596,17 +562,22 @@ app.post("/build-usdz", async (req, res) => {
     } catch {}
 
     const canUsdzip = await hasUsdzip();
-if (!canUsdzip) {
-  throw new Error("usdzip_missing_on_server");
-}
+    if (canUsdzip) {
+      usdzBuild.method = "usdzip";
+      usdzBuild = { ...usdzBuild, ...(await buildUsdzWithUsdzip(usdzPath, jobDir)) };
+    } else {
+      usdzBuild.method = "zip";
+      usdzBuild = {
+        ...usdzBuild,
+        ...(await buildUsdzWithZip(usdzPath, jobDir, ["model.usd", "texture.png"])),
+      };
+    }
 
-usdzBuild.method = "usdzip";
-usdzBuild = { ...usdzBuild, ...(await buildUsdzWithUsdzip(usdzPath, jobDir)) };
-
-if (!usdzBuild.ok) {
-  throw new Error(`usdzip_failed: ${(usdzBuild.err || usdzBuild.out || "").slice(0, 300)}`);
-}
-
+    if (!usdzBuild.ok) {
+      throw new Error(
+        `${usdzBuild.method}_failed: ${(usdzBuild.err || usdzBuild.out || "").slice(0, 400)}`
+      );
+    }
 
     if (!fs.existsSync(usdzPath) || fileSize(usdzPath) < 32) {
       throw new Error(`usdz_missing_or_empty (${usdzBuild.method})`);
@@ -621,28 +592,28 @@ if (!usdzBuild.ok) {
       usdzUrl: publicUsdzUrl,
       debug: {
         serverVersion: SERVER_VERSION,
-        imageUrl,
+        imageUrl: imageUrl || null,
         bytesIn: imgBuf.length,
         bytesOut: fileSize(usdzPath),
       },
       blender: {
         ok: blender.ok,
-        out: blender.out.slice(0, 4000),
-        err: blender.err.slice(0, 4000),
+        out: String(blender.out || "").slice(0, 4000),
+        err: String(blender.err || "").slice(0, 4000),
       },
       usd: usdcCheck,
       usdFix: {
         ok: !!usdFix.ok,
         ms: usdFix.ms,
-        out: (usdFix.out || "").slice(0, 4000),
-        err: (usdFix.err || "").slice(0, 4000),
+        out: String(usdFix.out || "").slice(0, 4000),
+        err: String(usdFix.err || "").slice(0, 4000),
         note: usdFix.note || null,
       },
       usdzBuild: {
         method: usdzBuild.method,
         ok: !!usdzBuild.ok,
-        out: (usdzBuild.out || "").slice(0, 8000),
-        err: (usdzBuild.err || "").slice(0, 8000),
+        out: String(usdzBuild.out || "").slice(0, 8000),
+        err: String(usdzBuild.err || "").slice(0, 8000),
       },
       jobDirListing,
     });
