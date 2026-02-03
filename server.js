@@ -10,7 +10,7 @@ const app = express();
 /* --------------------------------------------------
    VERSION STAMP (so you can confirm correct deploy)
 -------------------------------------------------- */
-const SERVER_VERSION = "server.js vCORS-2026-02-03-safe-usdzip";
+const SERVER_VERSION = "server.js vCORS-2026-02-03-safe-usdzip+blenderPXRfix";
 
 /* --------------------------------------------------
    CONFIG
@@ -188,7 +188,7 @@ async function runCmd(cmd, args, { cwd, timeoutMs } = {}) {
     child.stdout?.on("data", (d) => (out += d.toString()));
     child.stderr?.on("data", (d) => (err += d.toString()));
 
-    // 🔥 This is the missing piece: ENOENT lands here
+    // 🔥 ENOENT lands here
     child.on("error", (e) => {
       if (timer) clearTimeout(timer);
       done({
@@ -256,18 +256,38 @@ async function ensureUsdc(usdPath) {
 }
 
 /**
- * Fix common USD metadata that Quick Look / ARKit often expects.
+ * Fix common USD issues for Quick Look / ARKit.
+ *
+ * IMPORTANT: On Render/Docker, system python usually does NOT have pxr.
+ * Blender DOES have pxr in its embedded python. So we run Blender -b -P script.
+ *
+ * Fixes:
+ * - up axis = Y
+ * - metersPerUnit = 1
+ * - default prim set
+ * - rewrite ANY texture asset path -> basename (texture.png)
+ * - force bind a UsdPreviewSurface material that uses texture.png (Quick Look safe)
+ * - optional auto-scale if object is tiny
  */
-async function fixUsdForQuickLook(usdPath) {
-  const py = `
-from pxr import Usd, UsdGeom, Sdf, UsdShade
+async function fixUsdForQuickLook(usdPath, jobDir) {
+  const scriptPath = path.join(jobDir, "fix_quicklook.py");
+
+  const script = `
 import sys, os
 
-path = sys.argv[1]
-stage = Usd.Stage.Open(path)
+# Blender passes args after '--'
+if "--" not in sys.argv:
+  print("ERR: missing -- separator")
+  raise SystemExit(2)
+
+usdPath = sys.argv[sys.argv.index("--")+1]
+
+from pxr import Usd, UsdGeom, Sdf, UsdShade
+
+stage = Usd.Stage.Open(usdPath)
 if not stage:
-  print("ERR: cannot open", path)
-  sys.exit(2)
+  print("ERR: cannot open", usdPath)
+  raise SystemExit(2)
 
 # ---- Core Quick Look expectations ----
 UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
@@ -282,15 +302,13 @@ if not default:
   kids = stage.GetPseudoRoot().GetChildren()
   if kids:
     stage.SetDefaultPrim(kids[0])
+    default = stage.GetDefaultPrim()
 
-# ---- FIX TEXTURE PATHS (critical) ----
-# Make any asset path pointing to a PNG/JPG resolve to just the basename
-# e.g. /tmp/ar/.../texture.png -> texture.png
+# ---- FIX TEXTURE PATHS: /tmp/.../texture.png -> texture.png ----
 for prim in stage.Traverse():
   for attr in prim.GetAttributes():
     tn = attr.GetTypeName()
     try:
-      # Single asset
       if tn == Sdf.ValueTypeNames.Asset:
         v = attr.Get()
         if v and hasattr(v, "path"):
@@ -298,7 +316,6 @@ for prim in stage.Traverse():
           low = p.lower()
           if low.endswith((".png",".jpg",".jpeg",".webp")):
             attr.Set(Sdf.AssetPath(os.path.basename(p)))
-      # Array of assets
       elif tn == Sdf.ValueTypeNames.AssetArray:
         arr = attr.Get() or []
         out = []
@@ -316,10 +333,45 @@ for prim in stage.Traverse():
     except Exception:
       pass
 
+# ---- Find first Mesh under default prim ----
+meshPrim = None
+if default:
+  for p in Usd.PrimRange(default):
+    if p.GetTypeName() == "Mesh":
+      meshPrim = p
+      break
+
+# ---- FORCE UsdPreviewSurface material bound to mesh ----
+# Quick Look is picky; this guarantees texture displays.
+if meshPrim and default:
+  matPath = default.GetPath().AppendChild("NFS_Material")
+  mat = UsdShade.Material.Define(stage, matPath)
+
+  pbrPath = matPath.AppendChild("PreviewSurface")
+  pbr = UsdShade.Shader.Define(stage, pbrPath)
+  pbr.CreateIdAttr("UsdPreviewSurface")
+
+  texPath = matPath.AppendChild("Texture")
+  tex = UsdShade.Shader.Define(stage, texPath)
+  tex.CreateIdAttr("UsdUVTexture")
+  tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath("texture.png"))
+  tex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+  tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+  stPath = matPath.AppendChild("PrimvarST")
+  st = UsdShade.Shader.Define(stage, stPath)
+  st.CreateIdAttr("UsdPrimvarReader_float2")
+  st.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+  st.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+  tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st, "result")
+  pbr.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(tex, "rgb")
+
+  mat.CreateSurfaceOutput().ConnectToSource(pbr, "surface")
+  UsdShade.MaterialBindingAPI(meshPrim).Bind(mat)
+
 # ---- AUTO SCALE FIX (if it came out tiny) ----
-# If the bbox longest side is < 0.1m, scale it up by 100.
 try:
-  default = stage.GetDefaultPrim()
   if default:
     root = UsdGeom.Xformable(default)
     cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
@@ -327,21 +379,28 @@ try:
     size = bbox.GetSize()
     longest = max(size[0], size[1], size[2])
     if longest > 0 and longest < 0.10:
-      # add a scale op (100x)
       s = root.AddScaleOp()
       s.Set((100.0, 100.0, 100.0))
 except Exception as e:
   print("scale_fix_skipped", e)
 
 stage.Save()
-print("OK")
+print("OK fixed", usdPath)
 `;
 
-  const r = await runCmd("python3", ["-c", py, usdPath], { timeoutMs: 20000 });
+  fs.writeFileSync(scriptPath, script, "utf8");
+
+  const t0 = Date.now();
+  const r = await runCmd(
+    "blender",
+    ["-b", "-P", scriptPath, "--", usdPath],
+    { cwd: jobDir, timeoutMs: 120000 }
+  );
+
   if (!r.ok) {
-    return { ok: false, note: "pxr_python_missing_or_failed", ...r };
+    return { ok: false, note: "blender_pxr_fix_failed", ms: Date.now() - t0, ...r };
   }
-  return { ok: true, ...r };
+  return { ok: true, ms: Date.now() - t0, ...r };
 }
 
 /**
@@ -353,9 +412,10 @@ async function hasUsdzip() {
   return !!(r.ok && r.out && r.out.trim());
 }
 
-async function buildUsdzWithUsdzip(outUsdzPath, usdPath, assetPaths) {
-  const args = [outUsdzPath, usdPath, ...(assetPaths || [])];
-  return await runCmd("usdzip", args, { timeoutMs: 60000 });
+async function buildUsdzWithUsdzip(outUsdzPath, jobDir) {
+  // Use relative names inside the container (Quick Look expects a clean archive)
+  const args = [outUsdzPath, "model.usd", "texture.png"];
+  return await runCmd("usdzip", args, { cwd: jobDir, timeoutMs: 60000 });
 }
 
 async function buildUsdzWithZip(outUsdzPath, jobDir, files) {
@@ -417,7 +477,9 @@ app.post("/build-usdz", async (req, res) => {
 
     // Best-effort USDC + metadata fixes
     const usdcCheck = await ensureUsdc(usdPath);
-    const usdFix = await fixUsdForQuickLook(usdPath);
+
+    // ✅ IMPORTANT: Run Quick Look fix through Blender's python (pxr available there)
+    const usdFix = await fixUsdForQuickLook(usdPath, jobDir);
 
     // Build USDZ: prefer usdzip if installed, else zip -0
     let usdzBuild = { ok: false, method: null, out: "", err: "" };
@@ -429,7 +491,7 @@ app.post("/build-usdz", async (req, res) => {
     const canUsdzip = await hasUsdzip();
     if (canUsdzip) {
       usdzBuild.method = "usdzip";
-      usdzBuild = { ...usdzBuild, ...(await buildUsdzWithUsdzip(usdzPath, usdPath, [texPath])) };
+      usdzBuild = { ...usdzBuild, ...(await buildUsdzWithUsdzip(usdzPath, jobDir)) };
     } else {
       usdzBuild.method = "zip";
       usdzBuild = {
@@ -461,7 +523,13 @@ app.post("/build-usdz", async (req, res) => {
         err: blender.err.slice(0, 4000),
       },
       usd: usdcCheck,
-      usdFix,
+      usdFix: {
+        ok: !!usdFix.ok,
+        ms: usdFix.ms,
+        out: (usdFix.out || "").slice(0, 4000),
+        err: (usdFix.err || "").slice(0, 4000),
+        note: usdFix.note || null,
+      },
       usdzBuild: {
         method: usdzBuild.method,
         ok: !!usdzBuild.ok,
