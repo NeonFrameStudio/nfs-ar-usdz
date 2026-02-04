@@ -342,29 +342,18 @@ for prim in stage.Traverse():
     except Exception:
       pass
 
-# find meshes by name (preferred) or fall back to first mesh
-frameMesh = None
-glowMesh = None
-firstMesh = None
-
+# find first Mesh
+meshPrim = None
 if default:
   for p in Usd.PrimRange(default):
     if p.GetTypeName() == "Mesh":
-      if not firstMesh:
-        firstMesh = p
-      nm = p.GetName()
-      if nm == "NFS_Frame" and not frameMesh:
-        frameMesh = p
-      elif nm == "NFS_Glow" and not glowMesh:
-        glowMesh = p
+      meshPrim = p
+      break
 
-if not frameMesh:
-  frameMesh = firstMesh
-
-# ensure uv primvar is named st (on the frame mesh)
+# ensure uv primvar is named st
 try:
-  if frameMesh:
-    pv = UsdGeom.PrimvarsAPI(frameMesh)
+  if meshPrim:
+    pv = UsdGeom.PrimvarsAPI(meshPrim)
     stpv = pv.GetPrimvar("st")
     if (not stpv) or (not stpv.IsDefined()):
       candidate = None
@@ -388,10 +377,8 @@ try:
 except Exception as e:
   print("uv_fix_skipped", e)
 
-# -----------------------------
-# MATERIAL 1: PHOTO (frame)
-# -----------------------------
-if frameMesh and default:
+# force a UsdPreviewSurface material (Quick Look friendly)
+if meshPrim and default:
   matPath = default.GetPath().AppendChild("NFS_Material")
   mat = UsdShade.Material.Define(stage, matPath)
 
@@ -418,40 +405,7 @@ if frameMesh and default:
 
   matSurf = mat.CreateSurfaceOutput()
   matSurf.ConnectToSource(pbrOut)
-  UsdShade.MaterialBindingAPI(frameMesh).Bind(mat)
-
-# -----------------------------
-# MATERIAL 2: OUTLINE GLOW (ring)
-# NOTE: Quick Look has no bloom; this is subtle emissive + slight opacity.
-# -----------------------------
-try:
-  if glowMesh and default:
-    # make it double-sided so it reads from angles
-    try:
-      UsdGeom.Mesh(glowMesh).CreateDoubleSidedAttr(True)
-    except Exception:
-      pass
-
-    gMatPath = default.GetPath().AppendChild("NFS_GlowMaterial")
-    gMat = UsdShade.Material.Define(stage, gMatPath)
-
-    gPbrPath = gMatPath.AppendChild("PreviewSurface")
-    gPbr = UsdShade.Shader.Define(stage, gPbrPath)
-    gPbr.CreateIdAttr("UsdPreviewSurface")
-    gPbrOut = gPbr.CreateOutput("surface", Sdf.ValueTypeNames.Token)
-
-    # tweak these if you want more/less outline
-    gPbr.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set((1.0, 1.0, 1.0))
-    gPbr.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set((1.0, 1.0, 1.0))
-    gPbr.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0)
-    gPbr.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-    gPbr.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(0.22)  # subtle
-
-    gSurf = gMat.CreateSurfaceOutput()
-    gSurf.ConnectToSource(gPbrOut)
-    UsdShade.MaterialBindingAPI(glowMesh).Bind(gMat)
-except Exception as e:
-  print("glow_bind_skipped", e)
+  UsdShade.MaterialBindingAPI(meshPrim).Bind(mat)
 
 # autoscale if tiny
 try:
