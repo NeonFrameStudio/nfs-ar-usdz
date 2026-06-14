@@ -516,18 +516,7 @@ app.post("/build-usdz", async (req, res) => {
     }
 
     // Validate PNG (prevents grey/purple slabs from HTML/404)
-    if (!sniffPng(imgBuf)) {
-      return res.status(400).json({
-        ok: false,
-        reason: "image_not_png",
-        requestId,
-        debug: {
-          serverVersion: SERVER_VERSION,
-          firstBytesHex: Buffer.from(imgBuf.slice(0, 32)).toString("hex"),
-        },
-      });
-    }
-
+    
     fs.writeFileSync(texPath, imgBuf);
 
     // 2) Run Blender make_usd.py
